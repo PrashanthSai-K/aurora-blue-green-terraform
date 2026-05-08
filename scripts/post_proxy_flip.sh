@@ -7,7 +7,7 @@
 # When proxy_active_cluster was flipped → "old" (rollback):
 #   On bastion:
 #   1. Stop replication on old blue (was replica of new prod)
-#   2. Promote old blue to read-write (SET GLOBAL read_only = 0)
+#   2. Promote old blue to read-write (mysql.rds_set_read_write)
 #   3. Get new prod's binlog position (SHOW MASTER STATUS)
 #   4. Set up reverse replication on old blue → replicates TO new prod
 #      (so new prod stays in sync; re-promote later will have minimal lag)
@@ -24,7 +24,7 @@
 #   OLD_CLUSTER_ID        old blue cluster identifier
 #   NEW_CLUSTER_ID        current production cluster identifier
 #   AWS_REGION
-#   DB_SECRET_NAME        Secrets Manager secret name for master password
+#   DB_SECRET_NAME        Secrets Manager secret ARN for master credentials
 #   BASTION_INSTANCE_ID   EC2 instance ID of the bastion
 #
 # Optional:
@@ -75,13 +75,19 @@ OLD_ENDPOINT=$(aws rds describe-db-clusters \
 log "  New prod endpoint: $NEW_ENDPOINT"
 log "  Old blue endpoint: $OLD_ENDPOINT"
 
-# ── Step 2: Fetch DB password from Secrets Manager (runs on Terraform host) ──
-log "Fetching DB password from Secrets Manager: $DB_SECRET_NAME"
+# ── Step 2: Fetch DB credentials from Secrets Manager ─────────────────────────
+log "Fetching DB credentials from Secrets Manager: $DB_SECRET_NAME"
 SECRET_JSON=$(aws secretsmanager get-secret-value \
   --secret-id "$DB_SECRET_NAME" \
   --region "$AWS_REGION" \
   --query SecretString \
   --output text) || die "Failed to fetch secret $DB_SECRET_NAME"
+
+DB_USER=$(echo "$SECRET_JSON" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d.get('username', d.get('user', 'admin')))
+" 2>/dev/null) || die "Could not parse username from Secrets Manager JSON"
 
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "
 import sys, json
@@ -90,6 +96,7 @@ print(d.get('password', d.get('masterpassword', d.get('MYSQL_ROOT_PASSWORD', nex
 " 2>/dev/null) || die "Could not parse password from Secrets Manager JSON"
 
 [[ -z "$DB_PASS" ]] && die "Empty password from Secrets Manager"
+[[ -z "$DB_USER" ]] && DB_USER="admin"
 
 # ── Step 3: Build MySQL script for bastion ────────────────────────────────────
 if [[ "$PROXY_ACTIVE" == "old" ]]; then
@@ -101,11 +108,14 @@ set -euo pipefail
 OLD_ENDPOINT='${OLD_ENDPOINT}'
 NEW_ENDPOINT='${NEW_ENDPOINT}'
 DB_PORT='${DB_PORT}'
+DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 
 mysql_exec() {
   local host="\$1"; shift
-  mysql -h "\$host" -P "\$DB_PORT" -u admin -p"\$DB_PASS" --ssl-mode=REQUIRED -sNe "\$@" 2>/dev/null
+  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
+  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
 
 if ! command -v mysql &>/dev/null; then
@@ -116,11 +126,14 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on old blue (\$OLD_ENDPOINT)..."
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
-echo "[bastion] Replication stopped."
+if mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null; then
+  echo "[bastion] Replication stopped on old blue."
+else
+  echo "[bastion] WARN: rds_stop_replication returned non-zero (may not have been replicating) — continuing."
+fi
 
 echo "[bastion] Promoting old blue to read-write..."
-mysql_exec "\$OLD_ENDPOINT" "SET GLOBAL read_only = 0;"
+mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_read_write();"
 echo "[bastion] Old blue is now read-write (active production)."
 
 echo "[bastion] Getting new prod binlog position (\$NEW_ENDPOINT)..."
@@ -136,7 +149,7 @@ if [[ "\$CURRENT_MASTER" == "\$NEW_ENDPOINT" ]]; then
   echo "[bastion] Already replicating from new prod — skipping setup."
 else
   echo "[bastion] Setting up reverse replication: old blue → new prod..."
-  mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_external_master('\$NEW_ENDPOINT', \$DB_PORT, 'admin', '\$DB_PASS', '\$BINLOG_FILE', \$BINLOG_POS, 0);"
+  mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_external_master('\$NEW_ENDPOINT', \$DB_PORT, '\$DB_USER', '\$DB_PASS', '\$BINLOG_FILE', \$BINLOG_POS, 0);"
   mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_start_replication();"
   echo "[bastion] Reverse replication started: old blue → new prod."
 fi
@@ -156,11 +169,14 @@ set -euo pipefail
 OLD_ENDPOINT='${OLD_ENDPOINT}'
 NEW_ENDPOINT='${NEW_ENDPOINT}'
 DB_PORT='${DB_PORT}'
+DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 
 mysql_exec() {
   local host="\$1"; shift
-  mysql -h "\$host" -P "\$DB_PORT" -u admin -p"\$DB_PASS" --ssl-mode=REQUIRED -sNe "\$@" 2>/dev/null
+  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
+  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
 
 if ! command -v mysql &>/dev/null; then
@@ -171,11 +187,14 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on new prod (\$NEW_ENDPOINT)..."
-mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
-echo "[bastion] Replication stopped on new prod."
+if mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null; then
+  echo "[bastion] Replication stopped on new prod."
+else
+  echo "[bastion] WARN: rds_stop_replication returned non-zero (may not have been replicating) — continuing."
+fi
 
 echo "[bastion] Promoting new prod to read-write..."
-mysql_exec "\$NEW_ENDPOINT" "SET GLOBAL read_only = 0;"
+mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_set_read_write();"
 echo "[bastion] New prod is now read-write (active production)."
 
 echo "[bastion] Stopping reverse replication on old blue (\$OLD_ENDPOINT)..."

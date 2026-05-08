@@ -88,6 +88,12 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
   --query SecretString \
   --output text) || die "Failed to fetch secret $DB_SECRET_NAME"
 
+DB_USER=$(echo "$SECRET_JSON" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d.get('username', d.get('user', 'admin')))
+" 2>/dev/null) || die "Could not parse username from Secrets Manager JSON"
+
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -95,6 +101,7 @@ print(d.get('password', d.get('masterpassword', d.get('MYSQL_ROOT_PASSWORD', nex
 " 2>/dev/null) || die "Could not parse password from Secrets Manager JSON"
 
 [[ -z "$DB_PASS" ]] && die "Empty password from Secrets Manager"
+[[ -z "$DB_USER" ]] && DB_USER="admin"
 
 # ── Step 3: Build the MySQL script to run on the bastion ─────────────────────
 # Inject resolved values — bastion only needs MySQL client, not AWS access.
@@ -105,12 +112,15 @@ set -euo pipefail
 SOURCE_ENDPOINT='${SOURCE_ENDPOINT}'
 TARGET_ENDPOINT='${TARGET_ENDPOINT}'
 DB_PORT='${DB_PORT}'
+DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 MAX_LAG_WAIT_SEC='${MAX_LAG_WAIT_SEC}'
 
 mysql_exec() {
   local host="\$1"; shift
-  mysql -h "\$host" -P "\$DB_PORT" -u admin -p"\$DB_PASS" --ssl-mode=REQUIRED -sNe "\$@" 2>/dev/null
+  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
+  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
 
 # Install mysql client if missing (Amazon Linux 2023 ships mariadb105, not mysql)
@@ -122,8 +132,8 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Setting source (\$SOURCE_ENDPOINT) to read-only..."
-mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 1;" || {
-  echo "[bastion] ERROR: Failed to set read_only=1 on source. Check MySQL connectivity."
+mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_only();" || {
+  echo "[bastion] ERROR: Failed to set read_only on source. Check MySQL connectivity."
   exit 1
 }
 echo "[bastion] Source is now read-only."
@@ -135,7 +145,7 @@ while true; do
   if (( ELAPSED >= MAX_LAG_WAIT_SEC )); then
     echo "[bastion] TIMEOUT: lag did not reach 0 within \${MAX_LAG_WAIT_SEC}s"
     echo "[bastion] Restoring source to read-write..."
-    mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 0;" 2>/dev/null || true
+    mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
     exit 1
   fi
   LAG=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
