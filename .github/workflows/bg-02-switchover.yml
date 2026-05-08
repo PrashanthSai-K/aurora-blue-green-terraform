@@ -6,10 +6,20 @@ name: "Blue-Green | 2. Switchover"
 #
 # After apply, old_blue_cluster_id and bastion_instance_id are in Terraform state.
 # All rollback workflows read them directly — no manual IDs needed.
+#
+# Flow:
+#   plan job  — pre-flight check + plan, posts summary (no approval needed)
+#   apply job — waits for approval, then applies (provider blocks until SWITCHOVER_COMPLETED)
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'plan = preview only | apply = run switchover'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply]
       bastion_instance_id:
         description: 'Bastion EC2 instance ID (e.g. i-0abc123) — stored in state after this run'
         required: true
@@ -43,11 +53,11 @@ env:
   GO_VERSION: "1.21"
   PROVIDER_VERSION: "1.0.0"
 
+# ── Job 1: Plan (no approval needed) ─────────────────────────────────────────
 jobs:
-  switchover:
-    name: "Switchover Blue → Green"
+  plan:
+    name: "Plan — Switchover"
     runs-on: ubuntu-latest
-    environment: aurora-test
 
     steps:
       - name: Checkout
@@ -69,7 +79,6 @@ jobs:
 
       - name: Write variable overrides
         run: |
-          # Must match the values used in aurora-deploy for this environment.
           cat > /tmp/override.tfvars << EOF
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
@@ -112,10 +121,54 @@ jobs:
         run: |
           {
             echo "## Plan — Switchover"
+            echo "**Project:** \`${{ inputs.project_name }}\`  |  **Bastion:** \`${{ inputs.bastion_instance_id }}\`"
             echo '```'
             tail -30 /tmp/plan-output.txt
             echo '```'
+            if [ "${{ inputs.action }}" = "apply" ]; then
+              echo ""
+              echo "> Approve the **apply** job below to trigger switchover."
+            fi
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload plan artifact
+        if: inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-switchover
+          path: tfplan
+          retention-days: 1
+
+# ── Job 2: Apply (requires approval) ─────────────────────────────────────────
+  apply:
+    name: "Apply — Switchover"
+    needs: plan
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: aurora-test   # ← approval gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup (AWS + provider build + terraform init)
+        uses: ./.github/actions/tf-setup
+        with:
+          aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_session_token:    ${{ secrets.AWS_SESSION_TOKEN }}
+          aws_region:           ${{ inputs.aws_region }}
+          tf_state_bucket:      ${{ secrets.TF_STATE_BUCKET }}
+          tf_state_key:         ${{ inputs.tf_state_key }}
+          tf_state_lock_table:  ${{ secrets.TF_STATE_LOCK_TABLE }}
+          tf_version:           ${{ env.TF_VERSION }}
+          go_version:           ${{ env.GO_VERSION }}
+          provider_version:     ${{ env.PROVIDER_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-switchover
 
       - name: Terraform Apply — Switchover
         run: terraform apply -auto-approve tfplan

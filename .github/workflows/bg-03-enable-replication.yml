@@ -6,11 +6,21 @@ name: "Blue-Green | 3. Enable Reverse Replication"
 # All required values (old_blue_cluster_id, bastion_instance_id) are read directly
 # from Terraform state — no manual inputs needed.
 #
+# Flow:
+#   plan job  — reads state, runs plan, posts summary (no approval needed)
+#   apply job — waits for approval, then applies
+#
 # Prerequisite: bg-02-switchover must have completed.
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'plan = preview only | apply = enable replication'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply]
       project_name:
         description: 'Must match the project_name used in aurora-deploy (e.g. aurora-github-8a1)'
         required: false
@@ -37,11 +47,11 @@ env:
   GO_VERSION: "1.21"
   PROVIDER_VERSION: "1.0.0"
 
+# ── Job 1: Plan (no approval needed) ─────────────────────────────────────────
 jobs:
-  enable-replication:
-    name: "Enable Reverse Replication (new → old)"
+  plan:
+    name: "Plan — Enable Reverse Replication"
     runs-on: ubuntu-latest
-    environment: aurora-test
 
     steps:
       - name: Checkout
@@ -63,7 +73,6 @@ jobs:
 
       - name: Write variable overrides
         run: |
-          # Must match the values used in aurora-deploy for this environment.
           cat > /tmp/override.tfvars << EOF
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
@@ -116,10 +125,54 @@ jobs:
         run: |
           {
             echo "## Plan — Enable Reverse Replication"
+            echo "**Old Cluster:** \`${{ steps.state.outputs.old_cluster_id }}\`"
             echo '```'
             tail -30 /tmp/plan-output.txt
             echo '```'
+            if [ "${{ inputs.action }}" = "apply" ]; then
+              echo ""
+              echo "> Approve the **apply** job below to enable replication."
+            fi
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload plan artifact
+        if: inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-enable-replication
+          path: tfplan
+          retention-days: 1
+
+# ── Job 2: Apply (requires approval) ─────────────────────────────────────────
+  apply:
+    name: "Apply — Enable Reverse Replication"
+    needs: plan
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: aurora-test   # ← approval gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup (AWS + provider build + terraform init)
+        uses: ./.github/actions/tf-setup
+        with:
+          aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_session_token:    ${{ secrets.AWS_SESSION_TOKEN }}
+          aws_region:           ${{ inputs.aws_region }}
+          tf_state_bucket:      ${{ secrets.TF_STATE_BUCKET }}
+          tf_state_key:         ${{ inputs.tf_state_key }}
+          tf_state_lock_table:  ${{ secrets.TF_STATE_LOCK_TABLE }}
+          tf_version:           ${{ env.TF_VERSION }}
+          go_version:           ${{ env.GO_VERSION }}
+          provider_version:     ${{ env.PROVIDER_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-enable-replication
 
       - name: Terraform Apply — Enable Replication
         run: terraform apply -auto-approve tfplan

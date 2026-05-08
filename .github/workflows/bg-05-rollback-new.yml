@@ -5,11 +5,21 @@ name: "Blue-Green | 5. Re-promote → New Cluster"
 # All required values (old_blue_cluster_id, bastion_instance_id) are read directly
 # from Terraform state — no manual inputs needed beyond the state key.
 #
+# Flow:
+#   plan job  — reads state, runs plan, posts summary (no approval needed)
+#   apply job — waits for approval, then flips proxy back to new
+#
 # Prerequisite: bg-04-rollback-old must have run (proxy currently on old).
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'plan = preview only | apply = flip proxy back to new cluster'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply]
       project_name:
         description: 'Must match the project_name used in aurora-deploy (e.g. aurora-github-8a1)'
         required: false
@@ -36,11 +46,11 @@ env:
   GO_VERSION: "1.21"
   PROVIDER_VERSION: "1.0.0"
 
+# ── Job 1: Plan (no approval needed) ─────────────────────────────────────────
 jobs:
-  rollback-new:
-    name: "Re-promote — Proxy → New Cluster"
+  plan:
+    name: "Plan — Re-promote New Cluster"
     runs-on: ubuntu-latest
-    environment: aurora-test
 
     steps:
       - name: Checkout
@@ -62,7 +72,6 @@ jobs:
 
       - name: Write variable overrides
         run: |
-          # Must match the values used in aurora-deploy for this environment.
           cat > /tmp/override.tfvars << EOF
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
@@ -94,7 +103,7 @@ jobs:
           echo "bastion_id=$BASTION"    >> $GITHUB_OUTPUT
           echo "Old cluster : $OLD_ID"
           echo "Bastion     : $BASTION"
-          echo "Proxy now   : $CURRENT_PROXY → flipping back to new"
+          echo "Proxy now   : $CURRENT_PROXY → will flip back to new"
 
       - name: Terraform Plan — Re-promote New
         run: |
@@ -118,7 +127,50 @@ jobs:
             echo '```'
             tail -30 /tmp/plan-output.txt
             echo '```'
+            if [ "${{ inputs.action }}" = "apply" ]; then
+              echo ""
+              echo "> Approve the **apply** job below to flip proxy back to new cluster."
+            fi
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload plan artifact
+        if: inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-rollback-new
+          path: tfplan
+          retention-days: 1
+
+# ── Job 2: Apply (requires approval) ─────────────────────────────────────────
+  apply:
+    name: "Apply — Re-promote New Cluster"
+    needs: plan
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: aurora-test   # ← approval gate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup (AWS + provider build + terraform init)
+        uses: ./.github/actions/tf-setup
+        with:
+          aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_session_token:    ${{ secrets.AWS_SESSION_TOKEN }}
+          aws_region:           ${{ inputs.aws_region }}
+          tf_state_bucket:      ${{ secrets.TF_STATE_BUCKET }}
+          tf_state_key:         ${{ inputs.tf_state_key }}
+          tf_state_lock_table:  ${{ secrets.TF_STATE_LOCK_TABLE }}
+          tf_version:           ${{ env.TF_VERSION }}
+          go_version:           ${{ env.GO_VERSION }}
+          provider_version:     ${{ env.PROVIDER_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-rollback-new
 
       - name: Terraform Apply — Re-promote
         run: terraform apply -auto-approve tfplan
