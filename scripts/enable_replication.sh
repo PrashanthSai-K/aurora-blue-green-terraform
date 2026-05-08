@@ -118,6 +118,11 @@ mysql_exec() {
   local host="\$1"; shift
   mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
+# mysql_status keeps column headers (no -N) so SHOW...STATUS\G output can be grepped by label
+mysql_status() {
+  local host="\$1"; shift
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -se "\$@" 2>/dev/null
+}
 
 if ! command -v mysql &>/dev/null; then
   sudo dnf install -y mariadb105 2>/dev/null || \
@@ -127,12 +132,12 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available"; exit 1; }
 
 # Idempotency: if already replicating from the correct source, skip setup
-CURRENT_MASTER=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-  | grep "Master_Host:" | awk '{print \$2}' || echo "")
+CURRENT_MASTER=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+  | grep "Master_Host:" | awk '{print \$2}' || true)
 if [[ "\$CURRENT_MASTER" == "\$SOURCE_ENDPOINT" ]]; then
   echo "[bastion] Already replicating from \$SOURCE_ENDPOINT — verifying status..."
-  LAG=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-    | grep "Seconds_Behind_Master:" | awk '{print \$2}')
+  LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
   echo "[bastion] Replication already running. Seconds_Behind_Master=\${LAG:-unknown}"
   exit 0
 fi
@@ -165,8 +170,8 @@ mysql_exec "\$TARGET_ENDPOINT" "CALL mysql.rds_start_replication();"
 
 echo "[bastion] Replication started. Waiting for initial sync..."
 sleep 5
-LAG=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-  | grep "Seconds_Behind_Master:" | awk '{print \$2}')
+LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+  | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
 echo "[bastion] Replication running. Seconds_Behind_Master=\${LAG:-unknown}"
 echo "[bastion] Done: \$SOURCE_ENDPOINT → \$TARGET_ENDPOINT"
 SCRIPT

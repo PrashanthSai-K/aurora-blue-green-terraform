@@ -114,6 +114,11 @@ mysql_exec() {
   local host="\$1"; shift
   mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
+# mysql_status keeps column headers (no -N) so SHOW...STATUS\G output can be grepped by label
+mysql_status() {
+  local host="\$1"; shift
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -se "\$@" 2>/dev/null
+}
 
 if ! command -v mysql &>/dev/null; then
   sudo dnf install -y mariadb105 2>/dev/null || \
@@ -124,8 +129,8 @@ command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not availa
 
 # For repromote: check if target is actually replicating before waiting
 if [[ "\$PROXY_ACTIVE" == "new" ]]; then
-  LAG_CHECK=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || echo "")
+  LAG_CHECK=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
   if [[ -z "\$LAG_CHECK" || "\$LAG_CHECK" == "NULL" ]]; then
     echo "[bastion] WARN: target (\$TARGET_ENDPOINT) is not replicating — skipping lag wait."
     echo "[bastion] TIP: run bg-03 enable-replication after rollback to set up replication for zero-lag repromote."
@@ -151,8 +156,8 @@ while true; do
     mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
     exit 1
   fi
-  LAG=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || echo "NULL")
+  LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
   if [[ "\$LAG" == "0" ]]; then
     echo "[bastion] Replication lag = 0. Ready to flip proxy."
     exit 0
