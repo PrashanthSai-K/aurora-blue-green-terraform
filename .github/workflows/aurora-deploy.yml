@@ -82,7 +82,10 @@ jobs:
     environment: production
 
     steps:
-      - name: Setup (checkout + AWS + provider build + terraform init)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup (AWS + provider build + terraform init)
         uses: ./.github/actions/tf-setup
         with:
           aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
