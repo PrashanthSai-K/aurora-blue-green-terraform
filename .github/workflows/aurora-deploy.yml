@@ -4,11 +4,16 @@ name: "Aurora | Deploy from Scratch"
 # Change project_name + tf_state_key to spin up a completely isolated test environment.
 # Blue/Green variables are forced OFF — use the bg-* workflows for B/G operations.
 #
-# Secrets required (GitHub repo → Settings → Secrets → Actions):
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-#   TF_STATE_BUCKET         — S3 bucket for remote state
-#   TF_STATE_LOCK_TABLE     — DynamoDB lock table (optional, leave blank to skip)
-#   OKTA_API_TOKEN          — Okta API token
+# Flow:
+#   1. plan job  — always runs, posts plan to job summary, uploads tfplan artifact
+#   2. apply job — waits for manual approval (environment protection rule on aurora-test),
+#                  then downloads the saved plan and applies it
+#
+# One-time setup: Settings → Environments → aurora-test → Required reviewers → add yourself
+#
+# Secrets required (repo or environment level):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (if using temp creds)
+#   TF_STATE_BUCKET, TF_STATE_LOCK_TABLE, OKTA_API_TOKEN
 
 on:
   workflow_dispatch:
@@ -20,19 +25,17 @@ on:
         type: choice
         options: [plan, apply, destroy]
 
-      # ── State isolation ──────────────────────────────────────────────────────
       tf_state_key:
-        description: 'S3 state key — use a unique path per environment (e.g. aurora-test-1/terraform.tfstate)'
+        description: 'S3 state key — unique path per environment (e.g. aurora-test-1/terraform.tfstate)'
         required: false
         default: 'aurora-github/terraform.tfstate'
 
-      # ── Project identity ─────────────────────────────────────────────────────
       project_name:
-        description: 'Project prefix applied to every AWS resource name (e.g. aurora-okta-8a1, aurora-test-2)'
+        description: 'Project prefix for all AWS/Okta resource names (e.g. aurora-github-8a1)'
         required: false
         default: 'aurora-github-8a1'
       environment:
-        description: 'Environment tag (e.g. production, staging, test)'
+        description: 'Environment tag'
         required: false
         default: 'aurora-test'
       aws_region:
@@ -40,7 +43,6 @@ on:
         required: false
         default: 'us-east-1'
 
-      # ── Aurora config ────────────────────────────────────────────────────────
       aurora_cluster_name:
         description: 'Aurora cluster identifier'
         required: false
@@ -54,19 +56,17 @@ on:
         required: false
         default: 'db.t3.medium'
 
-      # ── Okta config ───────────────────────────────────────────────────────────
       okta_org_name:
         description: 'Okta org subdomain (blank = use value in terraform.tfvars)'
         required: false
         default: ''
 
-      # ── Bastion / network ────────────────────────────────────────────────────
       bastion_key_pair:
         description: 'EC2 key pair for bastion SSH access'
         required: false
         default: 'linux-key'
       local_ip_cidr:
-        description: 'Your IP in CIDR for direct bastion access (testing only)'
+        description: 'Your IP in CIDR for bastion access (testing only)'
         required: false
         default: '0.0.0.0/0'
 
@@ -75,11 +75,11 @@ env:
   GO_VERSION: "1.21"
   PROVIDER_VERSION: "1.0.0"
 
+# ── Job 1: Plan ───────────────────────────────────────────────────────────────
 jobs:
-  deploy:
-    name: "Aurora Deploy [${{ inputs.action }}] — ${{ inputs.project_name }}"
+  plan:
+    name: "Plan [${{ inputs.action }}] — ${{ inputs.project_name }}"
     runs-on: ubuntu-latest
-    environment: aurora-test
 
     steps:
       - name: Checkout
@@ -101,8 +101,6 @@ jobs:
 
       - name: Write variable overrides
         run: |
-          # Second var-file overrides committed terraform.tfvars values.
-          # Only write keys that the user actually wants to override.
           cat > /tmp/override.tfvars << EOF
           project_name          = "${{ inputs.project_name }}"
           environment           = "${{ inputs.environment }}"
@@ -143,15 +141,57 @@ jobs:
         run: |
           {
             echo "## Terraform Plan — \`${{ inputs.action }}\`"
-            echo "**Project:** \`${{ inputs.project_name }}\`  |  **State Key:** \`${{ inputs.tf_state_key }}\`"
+            echo "**Project:** \`${{ inputs.project_name }}\`  |  **State:** \`${{ inputs.tf_state_key }}\`"
             echo ""
             echo '```'
             tail -60 /tmp/plan-output.txt
             echo '```'
+            if [ "${{ inputs.action }}" != "plan" ]; then
+              echo ""
+              echo "> Approve the **apply** job below to execute this plan."
+            fi
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: Terraform Apply / Destroy
+      - name: Upload plan artifact
         if: inputs.action == 'apply' || inputs.action == 'destroy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+# ── Job 2: Apply (requires approval) ─────────────────────────────────────────
+  apply:
+    name: "Apply [${{ inputs.action }}] — ${{ inputs.project_name }}"
+    needs: plan
+    if: inputs.action == 'apply' || inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: aurora-test   # ← approval gate: Settings → Environments → aurora-test → Required reviewers
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup (AWS + provider build + terraform init)
+        uses: ./.github/actions/tf-setup
+        with:
+          aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_session_token:    ${{ secrets.AWS_SESSION_TOKEN }}
+          aws_region:           ${{ inputs.aws_region }}
+          tf_state_bucket:      ${{ secrets.TF_STATE_BUCKET }}
+          tf_state_key:         ${{ inputs.tf_state_key }}
+          tf_state_lock_table:  ${{ secrets.TF_STATE_LOCK_TABLE }}
+          tf_version:           ${{ env.TF_VERSION }}
+          go_version:           ${{ env.GO_VERSION }}
+          provider_version:     ${{ env.PROVIDER_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform Apply / Destroy
         run: terraform apply -auto-approve tfplan
         env:
           TF_VAR_okta_api_token: ${{ secrets.OKTA_API_TOKEN }}
@@ -178,5 +218,5 @@ jobs:
             echo ""
             echo "### Next Steps"
             echo "1. Test connectivity via bastion"
-            echo "2. When ready to upgrade engine version, run **bg-01-create-green** with the same \`tf_state_key\`"
+            echo "2. When ready to upgrade, run **bg-01-create-green** with the same \`tf_state_key\`"
           } >> $GITHUB_STEP_SUMMARY
