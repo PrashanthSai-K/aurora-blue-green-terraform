@@ -104,7 +104,6 @@ jobs:
         run: |
           OLD_ID=$(terraform output -raw old_blue_cluster_id 2>/dev/null || echo "")
           BASTION=$(terraform output -raw bastion_instance_id 2>/dev/null || echo "")
-          DB_SECRET=$(terraform output -raw db_secret_arn 2>/dev/null || echo "")
           PROXY_ACTIVE=$(terraform output -raw proxy_active_cluster 2>/dev/null || echo "new")
 
           if [ -z "$OLD_ID" ] || [ "$OLD_ID" = "null" ]; then
@@ -112,12 +111,29 @@ jobs:
             exit 1
           fi
 
-          echo "old_cluster_id=$OLD_ID"   >> $GITHUB_OUTPUT
-          echo "bastion_id=$BASTION"      >> $GITHUB_OUTPUT
-          echo "db_secret_arn=$DB_SECRET" >> $GITHUB_OUTPUT
+          # db_secret_arn was added after initial deploy so it may not be in state yet.
+          # Look it up directly via AWS CLI — faster and always current.
+          DB_SECRET=$(aws secretsmanager list-secrets \
+            --region "${{ inputs.aws_region }}" \
+            --filters "Key=name,Values=${{ inputs.project_name }}-aurora-credentialss" \
+            --query 'SecretList[0].ARN' \
+            --output text 2>/dev/null || echo "")
+          # Fallback to terraform output if the list-secrets call fails
+          [ -z "$DB_SECRET" ] || [ "$DB_SECRET" = "None" ] && \
+            DB_SECRET=$(terraform output -raw db_secret_arn 2>/dev/null || echo "")
+
+          if [ -z "$DB_SECRET" ] || [ "$DB_SECRET" = "None" ]; then
+            echo "ERROR: Could not resolve Secrets Manager ARN for ${{ inputs.project_name }}-aurora-credentialss"
+            exit 1
+          fi
+
+          echo "old_cluster_id=$OLD_ID"     >> $GITHUB_OUTPUT
+          echo "bastion_id=$BASTION"        >> $GITHUB_OUTPUT
+          echo "db_secret_arn=$DB_SECRET"   >> $GITHUB_OUTPUT
           echo "proxy_active=$PROXY_ACTIVE" >> $GITHUB_OUTPUT
           echo "Old cluster  : $OLD_ID"
           echo "Bastion      : $BASTION"
+          echo "Secret ARN   : $DB_SECRET"
           echo "Proxy active : $PROXY_ACTIVE"
 
       # ── enable-replication path ───────────────────────────────────────────
