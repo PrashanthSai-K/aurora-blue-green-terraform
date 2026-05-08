@@ -31,6 +31,10 @@ on:
         description: 'Must match the aurora_cluster_name used in aurora-deploy (e.g. aurora-github-db)'
         required: false
         default: 'aurora-github-db'
+      environment:
+        description: 'Environment tag — must match the environment used in aurora-deploy'
+        required: false
+        default: 'aurora-test'
       tf_state_key:
         description: 'S3 state key — must match the aurora-deploy run for this environment'
         required: false
@@ -76,6 +80,7 @@ jobs:
           cat > /tmp/override.tfvars << EOF
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
+          environment         = "${{ inputs.environment }}"
           rds_proxy_name      = "${{ inputs.project_name }}-proxy"
           iam_role_name       = "${{ inputs.project_name }}-readonly-role"
           iam_policy_name     = "${{ inputs.project_name }}-readonly-policy"
