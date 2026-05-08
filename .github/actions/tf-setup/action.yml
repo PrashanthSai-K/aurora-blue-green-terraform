@@ -11,6 +11,10 @@ inputs:
   aws_secret_access_key:
     description: 'AWS Secret Access Key'
     required: true
+  aws_session_token:
+    description: 'AWS Session Token — required when using temporary credentials (STS, SSO, MFA, assumed role). Leave blank for long-term IAM user keys.'
+    required: false
+    default: ''
   aws_region:
     description: 'AWS region'
     required: false
@@ -50,6 +54,7 @@ runs:
       with:
         aws-access-key-id: ${{ inputs.aws_access_key_id }}
         aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-session-token: ${{ inputs.aws_session_token }}
         aws-region: ${{ inputs.aws_region }}
 
     - name: Setup Go ${{ inputs.go_version }}
