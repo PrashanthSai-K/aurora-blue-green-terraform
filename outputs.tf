@@ -207,11 +207,6 @@ output "proxy_active_cluster" {
   description = "Which cluster the RDS Proxy currently routes to: \"new\" (production) or \"old\" (rollback)"
 }
 
-output "bastion_instance_id" {
-  value       = var.bastion_instance_id
-  description = "EC2 bastion instance ID used by proxy flip scripts — persisted in state so rollback workflows can read it"
-}
-
 output "replication_status" {
   value       = var.enable_blue_green ? aurora-bluegreen_deployment.main[0].replication_status : null
   description = "Binlog replication status for rollback (NOT_CONFIGURED / SETUP_PENDING / ACTIVE / STOPPED)"
