@@ -126,15 +126,17 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on old blue (\$OLD_ENDPOINT)..."
-if mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null; then
-  echo "[bastion] Replication stopped on old blue."
-else
-  echo "[bastion] WARN: rds_stop_replication returned non-zero (may not have been replicating) — continuing."
-fi
+mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
+echo "[bastion] Replication stop attempted on old blue."
 
 echo "[bastion] Promoting old blue to read-write..."
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_read_write();"
-echo "[bastion] Old blue is now read-write (active production)."
+mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
+RO_OLD=\$(mysql_exec "\$OLD_ENDPOINT" "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
+if [[ "\$RO_OLD" == "1" ]]; then
+  echo "[bastion] ERROR: old blue is still read-only after rds_set_read_write — manual intervention required."
+  exit 1
+fi
+echo "[bastion] Old blue is read-write (confirmed: read_only=\$RO_OLD)."
 
 echo "[bastion] Getting new prod binlog position (\$NEW_ENDPOINT)..."
 MASTER_STATUS=\$(mysql_exec "\$NEW_ENDPOINT" "SHOW MASTER STATUS\G")
@@ -187,15 +189,17 @@ fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on new prod (\$NEW_ENDPOINT)..."
-if mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null; then
-  echo "[bastion] Replication stopped on new prod."
-else
-  echo "[bastion] WARN: rds_stop_replication returned non-zero (may not have been replicating) — continuing."
-fi
+mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
+echo "[bastion] Replication stop attempted on new prod."
 
 echo "[bastion] Promoting new prod to read-write..."
-mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_set_read_write();"
-echo "[bastion] New prod is now read-write (active production)."
+mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
+RO_NEW=\$(mysql_exec "\$NEW_ENDPOINT" "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
+if [[ "\$RO_NEW" == "1" ]]; then
+  echo "[bastion] ERROR: new prod is still read-only after rds_set_read_write — manual intervention required."
+  exit 1
+fi
+echo "[bastion] New prod is read-write (confirmed: read_only=\$RO_NEW)."
 
 echo "[bastion] Stopping reverse replication on old blue (\$OLD_ENDPOINT)..."
 mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
