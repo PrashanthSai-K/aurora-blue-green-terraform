@@ -24,13 +24,13 @@ on:
       tf_state_key:
         description: 'S3 state key — use a unique path per environment (e.g. aurora-test-1/terraform.tfstate)'
         required: false
-        default: 'aurora-okta/terraform.tfstate'
+        default: 'aurora-github/terraform.tfstate'
 
       # ── Project identity ─────────────────────────────────────────────────────
       project_name:
         description: 'Project prefix applied to every AWS resource name (e.g. aurora-okta-8a1, aurora-test-2)'
         required: false
-        default: 'aurora-okta-8a1'
+        default: 'aurora-github-8a1'
       environment:
         description: 'Environment tag (e.g. production, staging, test)'
         required: false
@@ -44,7 +44,7 @@ on:
       aurora_cluster_name:
         description: 'Aurora cluster identifier'
         required: false
-        default: 'aurora-readonly-db'
+        default: 'aurora-github-db'
       aurora_engine_version:
         description: 'Aurora MySQL engine version'
         required: false

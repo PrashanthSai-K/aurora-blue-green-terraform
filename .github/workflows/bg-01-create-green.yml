@@ -26,7 +26,7 @@ on:
       tf_state_key:
         description: 'S3 state key — must match the aurora-deploy run for this environment'
         required: false
-        default: 'aurora-okta/terraform.tfstate'
+        default: 'aurora-github/terraform.tfstate'
       aws_region:
         description: 'AWS Region'
         required: false
