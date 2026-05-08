@@ -118,6 +118,7 @@ jobs:
             -var="enable_blue_green=true" \
             -var="trigger_switchover=true" \
             -var="proxy_active_cluster=old" \
+            -var="retain_old_cluster=true" \
             -var="old_blue_cluster_id=${{ steps.state.outputs.old_cluster_id }}" \
             -var="bastion_instance_id=${{ steps.state.outputs.bastion_id }}" \
             -out=tfplan \
