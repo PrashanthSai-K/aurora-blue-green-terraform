@@ -28,7 +28,7 @@ jobs:
   rollback-new:
     name: "Re-promote — Proxy → New Cluster"
     runs-on: ubuntu-latest
-    environment: production
+    environment: aurora-test
 
     steps:
       - name: Checkout

@@ -41,7 +41,8 @@ jobs:
   create-green:
     name: "Create Green Environment"
     runs-on: ubuntu-latest
-    environment: production
+    environment: aurora-test
+
 
     steps:
       - name: Checkout

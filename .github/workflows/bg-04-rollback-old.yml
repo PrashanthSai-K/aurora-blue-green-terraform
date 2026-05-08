@@ -33,7 +33,7 @@ jobs:
   rollback-old:
     name: "Rollback — Proxy → Old Cluster"
     runs-on: ubuntu-latest
-    environment: production
+    environment: aurora-test
 
     steps:
       - name: Checkout

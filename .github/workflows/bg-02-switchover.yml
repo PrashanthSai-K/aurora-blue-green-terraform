@@ -35,7 +35,7 @@ jobs:
   switchover:
     name: "Switchover Blue → Green"
     runs-on: ubuntu-latest
-    environment: production
+    environment: aurora-test
 
     steps:
       - name: Checkout

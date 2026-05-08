@@ -34,7 +34,7 @@ on:
       environment:
         description: 'Environment tag (e.g. production, staging, test)'
         required: false
-        default: 'production'
+        default: 'aurora-test'
       aws_region:
         description: 'AWS Region'
         required: false
@@ -79,7 +79,7 @@ jobs:
   deploy:
     name: "Aurora Deploy [${{ inputs.action }}] — ${{ inputs.project_name }}"
     runs-on: ubuntu-latest
-    environment: production
+    environment: aurora-test
 
     steps:
       - name: Checkout
