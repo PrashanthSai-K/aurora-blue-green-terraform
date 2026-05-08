@@ -142,11 +142,23 @@ mysql_exec "\$TARGET_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null 
 mysql_exec "\$TARGET_ENDPOINT" "CALL mysql.rds_reset_external_master();" 2>/dev/null || true
 
 echo "[bastion] Getting binlog position from source (\$SOURCE_ENDPOINT)..."
-MASTER_STATUS=\$(mysql_exec "\$SOURCE_ENDPOINT" "SHOW MASTER STATUS\G")
+MASTER_STATUS=\$(mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+  -sNe "SHOW MASTER STATUS\G" 2>&1) || {
+  echo "[bastion] ERROR: SHOW MASTER STATUS failed on source. MySQL said:"
+  echo "  \$MASTER_STATUS"
+  echo "[bastion] TIP: Binary logging must be enabled on the source cluster."
+  echo "[bastion] Set binlog_format=ROW (or MIXED) in the Aurora cluster parameter group, then reboot the cluster."
+  exit 1
+}
 BINLOG_FILE=\$(echo "\$MASTER_STATUS" | grep "File:" | awk '{print \$2}')
 BINLOG_POS=\$(echo "\$MASTER_STATUS" | grep "Position:" | awk '{print \$2}')
 
-[[ -z "\$BINLOG_FILE" ]] && { echo "[bastion] ERROR: Could not read binlog position from source"; exit 1; }
+if [[ -z "\$BINLOG_FILE" ]]; then
+  echo "[bastion] ERROR: SHOW MASTER STATUS returned no binlog info."
+  echo "[bastion] Raw output: \$MASTER_STATUS"
+  echo "[bastion] TIP: Binary logging is likely disabled. Set binlog_format=ROW in the cluster parameter group."
+  exit 1
+fi
 echo "[bastion] Binlog: file=\$BINLOG_FILE  pos=\$BINLOG_POS"
 
 echo "[bastion] Setting up replication: \$TARGET_ENDPOINT → replicates from \$SOURCE_ENDPOINT ..."
