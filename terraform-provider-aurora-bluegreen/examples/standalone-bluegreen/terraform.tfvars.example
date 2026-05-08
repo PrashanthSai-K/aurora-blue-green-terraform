@@ -1,0 +1,17 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# cp terraform.tfvars.example terraform.tfvars
+
+aws_region                = "us-east-1"
+source_cluster_identifier = "my-aurora-cluster"        # your existing cluster ID
+target_engine_version     = "8.0.mysql_aurora.3.07.1"  # same or newer version
+parameter_group_family    = "aurora-mysql8.0"
+
+# Phase 1 default — leave as false for initial apply
+trigger_switchover = false
+
+tags = {
+  Environment = "production"
+  ManagedBy   = "terraform"
+}
+
+# rollback and replication testing in progress — keep it as it is
