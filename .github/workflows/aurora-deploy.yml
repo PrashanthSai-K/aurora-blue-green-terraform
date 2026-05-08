@@ -113,6 +113,10 @@ jobs:
           bastion_key_pair      = "${{ inputs.bastion_key_pair }}"
           local_ip_cidr         = "${{ inputs.local_ip_cidr }}"
           rds_proxy_name        = "${{ inputs.project_name }}-proxy"
+          iam_role_name         = "${{ inputs.project_name }}-readonly-role"
+          iam_policy_name       = "${{ inputs.project_name }}-readonly-policy"
+          okta_app_name         = "${{ inputs.project_name }}-app"
+          okta_group_name       = "${{ inputs.project_name }}-readonly-users"
           enable_blue_green     = false
           trigger_switchover    = false
           EOF
