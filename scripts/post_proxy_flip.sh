@@ -109,8 +109,11 @@ mysql_exec() {
 }
 
 if ! command -v mysql &>/dev/null; then
-  sudo dnf install -y mysql 2>/dev/null || sudo yum install -y mysql 2>/dev/null || true
+  sudo dnf install -y mariadb105 2>/dev/null || \
+  sudo yum install -y mariadb 2>/dev/null || \
+  sudo apt-get install -y mysql-client 2>/dev/null || true
 fi
+command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on old blue (\$OLD_ENDPOINT)..."
 mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
@@ -161,8 +164,11 @@ mysql_exec() {
 }
 
 if ! command -v mysql &>/dev/null; then
-  sudo dnf install -y mysql 2>/dev/null || sudo yum install -y mysql 2>/dev/null || true
+  sudo dnf install -y mariadb105 2>/dev/null || \
+  sudo yum install -y mariadb 2>/dev/null || \
+  sudo apt-get install -y mysql-client 2>/dev/null || true
 fi
+command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Stopping replication on new prod (\$NEW_ENDPOINT)..."
 mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true

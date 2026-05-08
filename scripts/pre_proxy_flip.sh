@@ -113,10 +113,13 @@ mysql_exec() {
   mysql -h "\$host" -P "\$DB_PORT" -u admin -p"\$DB_PASS" --ssl-mode=REQUIRED -sNe "\$@" 2>/dev/null
 }
 
-# Install mysql client if missing
+# Install mysql client if missing (Amazon Linux 2023 ships mariadb105, not mysql)
 if ! command -v mysql &>/dev/null; then
-  sudo dnf install -y mysql 2>/dev/null || sudo yum install -y mysql 2>/dev/null || true
+  sudo dnf install -y mariadb105 2>/dev/null || \
+  sudo yum install -y mariadb 2>/dev/null || \
+  sudo apt-get install -y mysql-client 2>/dev/null || true
 fi
+command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
 
 echo "[bastion] Setting source (\$SOURCE_ENDPOINT) to read-only..."
 mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 1;" || {
