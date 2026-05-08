@@ -44,7 +44,7 @@ resource "null_resource" "pre_proxy_flip" {
       NEW_CLUSTER_ID        = var.aurora_cluster_name
       RDS_PROXY_NAME        = var.rds_proxy_name
       AWS_REGION            = var.aws_region
-      DB_SECRET_NAME        = "${var.project_name}-master-password"
+      DB_SECRET_NAME        = aws_secretsmanager_secret.aurora_credentials.id
       BASTION_INSTANCE_ID   = var.bastion_instance_id
     }
   }
@@ -94,7 +94,7 @@ resource "null_resource" "post_proxy_flip" {
       NEW_CLUSTER_ID        = var.aurora_cluster_name
       RDS_PROXY_NAME        = var.rds_proxy_name
       AWS_REGION            = var.aws_region
-      DB_SECRET_NAME        = "${var.project_name}-master-password"
+      DB_SECRET_NAME        = aws_secretsmanager_secret.aurora_credentials.id
       BASTION_INSTANCE_ID   = var.bastion_instance_id
     }
   }
