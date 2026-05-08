@@ -1,0 +1,117 @@
+name: "Blue-Green | 1. Create Green"
+
+# Phase 1: Creates the green Aurora cluster and waits until AVAILABLE.
+# The aurora-bluegreen provider polls internally — terraform apply blocks
+# until green is ready (~20-60 min), then writes state to S3.
+#
+# After this succeeds:
+#   1. Test your app against the green cluster endpoint shown in the summary
+#   2. When satisfied, run bg-02-switchover
+#
+# Use the same tf_state_key as your initial aurora-deploy run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'plan = preview only | apply = create green cluster'
+        required: true
+        default: 'plan'
+        type: choice
+        options: [plan, apply]
+      green_engine_version:
+        description: 'Aurora engine version for green (blank = same as blue, e.g. 8.0.mysql_aurora.3.10.3)'
+        required: false
+        default: ''
+      tf_state_key:
+        description: 'S3 state key — must match the aurora-deploy run for this environment'
+        required: false
+        default: 'aurora-okta/terraform.tfstate'
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        default: 'us-east-1'
+
+env:
+  TF_VERSION: "1.9.0"
+  GO_VERSION: "1.21"
+  PROVIDER_VERSION: "1.0.0"
+
+jobs:
+  create-green:
+    name: "Create Green Environment"
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Setup (checkout + AWS + provider build + terraform init)
+        uses: ./.github/actions/tf-setup
+        with:
+          aws_access_key_id:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_region:           ${{ inputs.aws_region }}
+          tf_state_bucket:      ${{ secrets.TF_STATE_BUCKET }}
+          tf_state_key:         ${{ inputs.tf_state_key }}
+          tf_state_lock_table:  ${{ secrets.TF_STATE_LOCK_TABLE }}
+          tf_version:           ${{ env.TF_VERSION }}
+          go_version:           ${{ env.GO_VERSION }}
+          provider_version:     ${{ env.PROVIDER_VERSION }}
+
+      - name: Terraform Plan — Create Green
+        run: |
+          terraform plan \
+            -var-file="terraform.tfvars" \
+            -var="enable_blue_green=true" \
+            -var="trigger_switchover=false" \
+            -var="green_engine_version=${{ inputs.green_engine_version }}" \
+            -out=tfplan \
+            2>&1 | tee /tmp/plan-output.txt
+        env:
+          TF_VAR_okta_api_token: ${{ secrets.OKTA_API_TOKEN }}
+
+      - name: Plan Summary
+        run: |
+          {
+            echo "## Plan — Create Green"
+            echo '```'
+            tail -40 /tmp/plan-output.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Apply — Create Green
+        if: inputs.action == 'apply'
+        run: terraform apply -auto-approve tfplan
+        # Provider blocks here until green reaches AVAILABLE (~20-60 min).
+        env:
+          TF_VAR_okta_api_token: ${{ secrets.OKTA_API_TOKEN }}
+
+      - name: Output Summary
+        if: inputs.action == 'apply'
+        run: |
+          BG_ID=$(terraform output -raw blue_green_deployment_id 2>/dev/null || echo "N/A")
+          STATUS=$(terraform output -raw blue_green_status 2>/dev/null || echo "N/A")
+          GREEN_ARN=$(terraform output -raw green_cluster_arn 2>/dev/null || echo "")
+
+          GREEN_ENDPOINT="N/A"
+          if [ -n "$GREEN_ARN" ]; then
+            TARGET_CLUSTER=$(basename "$GREEN_ARN")
+            GREEN_ENDPOINT=$(aws rds describe-db-clusters \
+              --db-cluster-identifier "$TARGET_CLUSTER" \
+              --query "DBClusters[0].Endpoint" \
+              --output text 2>/dev/null || echo "N/A")
+          fi
+
+          {
+            echo "## Green Environment Created"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Deployment ID | \`$BG_ID\` |"
+            echo "| Status | \`$STATUS\` |"
+            echo "| Green Endpoint | \`$GREEN_ENDPOINT\` |"
+            echo "| Engine Version | \`${{ inputs.green_engine_version || 'same as blue' }}\` |"
+            echo ""
+            echo "### Next Steps"
+            echo "1. Validate your app against green endpoint: \`$GREEN_ENDPOINT\`"
+            echo "2. Run **bg-02-switchover** when ready to promote green to production"
+          } >> $GITHUB_STEP_SUMMARY

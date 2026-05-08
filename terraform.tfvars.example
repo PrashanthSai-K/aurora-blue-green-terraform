@@ -1,0 +1,42 @@
+# AWS Configuration
+aws_region  = "us-east-1"
+environment = "production"
+project_name = "aurora-okta"
+
+# VPC Configuration (using defaults - adjust if needed)
+# vpc_cidr = "10.0.0.0/16"
+# availability_zones = ["us-east-1a", "us-east-1b"]
+# private_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
+# public_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+# Aurora Configuration
+aurora_cluster_name    = "aurora-readonly-db"
+aurora_engine_version  = "8.0.mysql_aurora.3.04.0"
+aurora_instance_class  = "db.t4g.small"
+aurora_backup_retention = 7
+aurora_master_username = "admin"
+aurora_multi_az        = true
+
+# Database Configuration
+database_name    = "appdb"
+readonly_username = "readonly_user"
+
+# RDS Proxy Configuration
+rds_proxy_enabled             = true
+rds_proxy_max_connections     = 100
+rds_proxy_max_idle_connections = 10
+
+# Okta Configuration
+# Get these values from your Okta account
+# org_name is the subdomain, e.g., "dev-12345678" from "https://dev-12345678.okta.com"
+# base_url is typically "https://integrator-8545897.okta.com"
+okta_org_name = "integrator-8545897"
+okta_base_url = "https://integrator-8545897.okta.com"
+okta_api_token = "00Roc77LfH_CJFYZ9IE2CILQxCECsY42j1LcmH87Tm"
+okta_app_name = "okta-aurora-app"
+okta_group_name = "aurora-readonly-users"
+
+# IAM Configuration
+iam_role_name  = "aurora-readonly-role"
+iam_policy_name = "aurora-readonly-policy"
+session_duration = 3600 # 1 hour in seconds

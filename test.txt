@@ -1,0 +1,60 @@
+     connect to bastion from aws 
+     
+     
+      mysql -h aurora-readonly-db-instance-1.cuukwis7t1js.us-east-1.rds.amazonaws.com \
+    -u admin -p'Q5OL)SMyax-AK_i2mNXrx3)>XWwGY&$5' appdb
+
+    
+    aws secretsmanager get-secret-value \
+    --secret-id "aurora-okta-8a1-aurora-credentials" \
+    --query 'SecretString' --output text | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['password'])"
+
+  Then in the SSM session on the bastion, use that password in single quotes (it has special characters):
+
+  mysql -h aurora-readonly-db-instance-1.cuukwis7t1js.us-east-1.rds.amazonaws.com \
+    -u admin -p'PASTE_PASSWORD_HERE' appdb
+
+  Once inside MySQL, run:
+
+  CREATE USER IF NOT EXISTS 'readonly_user'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';
+  GRANT SELECT, SHOW VIEW ON appdb.* TO 'readonly_user'@'%';
+
+  CREATE USER IF NOT EXISTS 'readwrite_user'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';
+  GRANT SELECT, INSERT, UPDATE, DELETE, SHOW VIEW ON appdb.* TO 'readwrite_user'@'%';
+
+  CREATE USER IF NOT EXISTS 'dba_user'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';
+  GRANT ALL PRIVILEGES ON appdb.* TO 'dba_user'@'%';
+
+  FLUSH PRIVILEGES;
+  SELECT user, host, plugin FROM mysql.user WHERE user IN ('readonly_user','readwrite_user','dba_user');
+
+
+  # Step 1 — assume the role (get fresh creds)
+  CREDS=$(aws sts assume-role \
+    --role-arn arn:aws:iam::853973692277:role/aurora-okta-8a1-poc-readonly-role \
+    --role-session-name poc-readonly-test \
+    --output json)
+
+  # Step 2 — export the creds
+  export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import json,sys; print(json.load(sys.stdin)['Credentials']['AccessKeyId'])")
+  export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import json,sys; print(json.load(sys.stdin)['Credentials']['SecretAccessKey'])")
+  export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import json,sys; print(json.load(sys.stdin)['Credentials']['SessionToken'])")
+
+  # Step 3 — generate token AFTER exporting creds
+  TOKEN=$(aws rds generate-db-auth-token \
+    --hostname aurora-readonly-db-instance-1.cuukwis7t1js.us-east-1.rds.amazonaws.com \
+    --port 3306 \
+    --region us-east-1 \
+    --username readonly_user)
+
+  # Step 4 — verify token is set
+  echo "Token length: ${#TOKEN}"
+
+  # Step 5 — connect
+  mysql -h aurora-readonly-db-instance-1.cuukwis7t1js.us-east-1.rds.amazonaws.com \
+    -u readonly_user \
+    --password="$TOKEN" \
+    --ssl-mode=REQUIRED \
+    --enable-cleartext-plugin \
+    appdb
+

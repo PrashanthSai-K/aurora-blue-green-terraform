@@ -1,0 +1,20 @@
+# Terraform working directory
+.terraform/
+
+# Lock file is regenerated per-platform (darwin vs linux) because local/aurora-bluegreen
+# is resolved from a filesystem mirror — checksums differ per OS/arch.
+.terraform.lock.hcl
+
+# Plan files
+*.tfplan
+tfplan-*
+
+# Sensitive local overrides
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# OS noise
+.DS_Store

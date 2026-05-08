@@ -1,0 +1,110 @@
+name: 'Terraform + Aurora Provider Setup'
+description: |
+  Composite action: checkout, AWS creds, build aurora-bluegreen provider,
+  write filesystem_mirror terraformrc, terraform init against S3 backend.
+  Called by every bg-* and aurora-deploy workflow to avoid repetition.
+
+inputs:
+  aws_access_key_id:
+    description: 'AWS Access Key ID'
+    required: true
+  aws_secret_access_key:
+    description: 'AWS Secret Access Key'
+    required: true
+  aws_region:
+    description: 'AWS region'
+    required: false
+    default: 'us-east-1'
+  tf_state_bucket:
+    description: 'S3 bucket for Terraform remote state'
+    required: true
+  tf_state_key:
+    description: 'S3 key (path) for this environment — change per env to isolate state'
+    required: false
+    default: 'aurora-okta/terraform.tfstate'
+  tf_state_lock_table:
+    description: 'DynamoDB table for state locking (leave blank to skip)'
+    required: false
+    default: ''
+  tf_version:
+    description: 'Terraform CLI version'
+    required: false
+    default: '1.9.0'
+  go_version:
+    description: 'Go version for building the provider'
+    required: false
+    default: '1.21'
+  provider_version:
+    description: 'aurora-bluegreen provider semver'
+    required: false
+    default: '1.0.0'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ inputs.aws_access_key_id }}
+        aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Setup Go ${{ inputs.go_version }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go_version }}
+        cache-dependency-path: terraform-provider-aurora-bluegreen/go.sum
+
+    - name: Build & Install Custom Provider
+      shell: bash
+      run: |
+        set -e
+        cd terraform-provider-aurora-bluegreen
+        go mod tidy
+        go build -ldflags "-X main.version=${{ inputs.provider_version }}" -o terraform-provider-aurora-bluegreen .
+        PLUGIN_DIR="$HOME/.terraform.d/plugins/registry.terraform.io/local/aurora-bluegreen/${{ inputs.provider_version }}/linux_amd64"
+        mkdir -p "$PLUGIN_DIR"
+        cp terraform-provider-aurora-bluegreen "$PLUGIN_DIR/"
+        echo "Provider installed → $PLUGIN_DIR"
+
+    - name: Write ~/.terraformrc (filesystem_mirror for local provider)
+      shell: bash
+      run: |
+        # printf avoids heredoc quoting issues in composite actions
+        PLUGIN_BASE="$HOME/.terraform.d/plugins"
+        {
+          echo 'provider_installation {'
+          echo '  filesystem_mirror {'
+          printf '    path    = "%s"\n' "$PLUGIN_BASE"
+          echo '    include = ["local/aurora-bluegreen"]'
+          echo '  }'
+          echo '  direct {'
+          echo '    exclude = ["local/aurora-bluegreen"]'
+          echo '  }'
+          echo '}'
+        } > ~/.terraformrc
+
+    - name: Setup Terraform ${{ inputs.tf_version }}
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.tf_version }}
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      shell: bash
+      run: |
+        set -e
+        LOCK_ARGS=""
+        if [ -n "${{ inputs.tf_state_lock_table }}" ]; then
+          LOCK_ARGS="-backend-config=dynamodb_table=${{ inputs.tf_state_lock_table }}"
+        fi
+        terraform init \
+          -backend-config="bucket=${{ inputs.tf_state_bucket }}" \
+          -backend-config="key=${{ inputs.tf_state_key }}" \
+          -backend-config="region=${{ inputs.aws_region }}" \
+          -backend-config="encrypt=true" \
+          $LOCK_ARGS \
+          -reconfigure
