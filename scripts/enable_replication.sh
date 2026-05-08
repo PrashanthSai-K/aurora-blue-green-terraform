@@ -150,13 +150,13 @@ MASTER_STATUS=\$(mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\
   echo "[bastion] Set binlog_format=ROW (or MIXED) in the Aurora cluster parameter group, then reboot the cluster."
   exit 1
 }
-BINLOG_FILE=\$(echo "\$MASTER_STATUS" | grep "File:" | awk '{print \$2}')
-BINLOG_POS=\$(echo "\$MASTER_STATUS" | grep "Position:" | awk '{print \$2}')
+BINLOG_FILE=\$(echo "\$MASTER_STATUS" | grep "File:" | awk '{print \$2}' || true)
+BINLOG_POS=\$(echo "\$MASTER_STATUS" | grep "Position:" | awk '{print \$2}' || true)
 
 if [[ -z "\$BINLOG_FILE" ]]; then
-  echo "[bastion] ERROR: SHOW MASTER STATUS returned no binlog info."
-  echo "[bastion] Raw output: \$MASTER_STATUS"
-  echo "[bastion] TIP: Binary logging is likely disabled. Set binlog_format=ROW in the cluster parameter group."
+  echo "[bastion] ERROR: Could not parse binlog position. Raw SHOW MASTER STATUS output:"
+  echo "\$MASTER_STATUS" | sed 's/^/  /'
+  echo "[bastion] If output is empty: binary logging is disabled — set binlog_format=ROW in the cluster parameter group."
   exit 1
 fi
 echo "[bastion] Binlog: file=\$BINLOG_FILE  pos=\$BINLOG_POS"
