@@ -171,6 +171,11 @@ output "connection_instructions" {
   sensitive = true
 }
 
+output "db_secret_arn" {
+  value       = aws_secretsmanager_secret.aurora_credentials.id
+  description = "ARN of the Secrets Manager secret holding Aurora master credentials — used by bg-03 workflow scripts"
+}
+
 output "aws_account_id" {
   value       = data.aws_caller_identity.current.account_id
   description = "AWS Account ID"

@@ -1,34 +1,19 @@
 #!/usr/bin/env bash
 # scripts/post_proxy_flip.sh
 #
-# Phase 3 of the zero-data-loss proxy flip sequence.
-# Runs on the TERRAFORM HOST — uses SSM to execute MySQL commands on the bastion.
+# Promotes the newly active cluster to read-write after a proxy flip.
+# Called as a GitHub Actions step — does NOT set up replication (see enable_replication.sh).
 #
-# When proxy_active_cluster was flipped → "old" (rollback):
-#   On bastion:
-#   1. Stop replication on old blue (was replica of new prod)
-#   2. Promote old blue to read-write (mysql.rds_set_read_write)
-#   3. Get new prod's binlog position (SHOW MASTER STATUS)
-#   4. Set up reverse replication on old blue → replicates TO new prod
-#      (so new prod stays in sync; re-promote later will have minimal lag)
-#   5. Start replication
+#   PROXY_ACTIVE=old → promote OLD blue cluster to read-write
+#   PROXY_ACTIVE=new → promote NEW prod cluster to read-write
 #
-# When proxy_active_cluster was flipped → "new" (re-promote):
-#   On bastion:
-#   1. Stop replication on new prod (was receiving from old blue during rollback)
-#   2. Promote new prod to read-write
-#   3. Stop replication + reset on old blue
-#
-# Required env vars (set by null_resource.post_proxy_flip in blue_green.tf):
-#   PROXY_ACTIVE          "new" or "old" (the value just applied)
+# Required env vars:
+#   PROXY_ACTIVE          "new" or "old"
 #   OLD_CLUSTER_ID        old blue cluster identifier
 #   NEW_CLUSTER_ID        current production cluster identifier
 #   AWS_REGION
 #   DB_SECRET_NAME        Secrets Manager secret ARN for master credentials
 #   BASTION_INSTANCE_ID   EC2 instance ID of the bastion
-#
-# Optional:
-#   DB_PORT   MySQL port (default 3306)
 
 set -euo pipefail
 
@@ -40,43 +25,38 @@ DB_SECRET_NAME="${DB_SECRET_NAME:-}"
 BASTION_INSTANCE_ID="${BASTION_INSTANCE_ID:-}"
 DB_PORT="${DB_PORT:-3306}"
 
-log()  { echo "[post_proxy_flip] $*" >&2; }
-die()  { log "ERROR: $*"; exit 1; }
+log() { echo "[post_proxy_flip] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
 
-# ── Validate inputs ───────────────────────────────────────────────────────────
-[[ -z "$OLD_CLUSTER_ID" ]]        && die "OLD_CLUSTER_ID is not set."
-[[ -z "$NEW_CLUSTER_ID" ]]        && die "NEW_CLUSTER_ID is not set."
-[[ -z "$DB_SECRET_NAME" ]]        && die "DB_SECRET_NAME is not set."
-[[ -z "$BASTION_INSTANCE_ID" ]]   && die "BASTION_INSTANCE_ID is not set. Add it to terraform.tfvars."
+[[ -z "$OLD_CLUSTER_ID" ]]      && die "OLD_CLUSTER_ID is not set."
+[[ -z "$NEW_CLUSTER_ID" ]]      && die "NEW_CLUSTER_ID is not set."
+[[ -z "$DB_SECRET_NAME" ]]      && die "DB_SECRET_NAME is not set."
+[[ -z "$BASTION_INSTANCE_ID" ]] && die "BASTION_INSTANCE_ID is not set."
 
-log "Post-proxy-flip (proxy_active_cluster=$PROXY_ACTIVE)"
-log "  Old cluster: $OLD_CLUSTER_ID"
-log "  New cluster: $NEW_CLUSTER_ID"
+# Determine which cluster just became active
+if [[ "$PROXY_ACTIVE" == "old" ]]; then
+  ACTIVE_CLUSTER="$OLD_CLUSTER_ID"
+  log "Proxy flipped to old blue — promoting $ACTIVE_CLUSTER to read-write"
+elif [[ "$PROXY_ACTIVE" == "new" ]]; then
+  ACTIVE_CLUSTER="$NEW_CLUSTER_ID"
+  log "Proxy flipped to new prod — promoting $ACTIVE_CLUSTER to read-write"
+else
+  die "Unexpected PROXY_ACTIVE value: '$PROXY_ACTIVE'"
+fi
+
 log "  Bastion: $BASTION_INSTANCE_ID"
 
-# ── Step 1: Resolve endpoints (AWS API — runs on Terraform host) ──────────────
-log "Resolving Aurora endpoints via AWS API..."
-
-NEW_ENDPOINT=$(aws rds describe-db-clusters \
-  --db-cluster-identifier "$NEW_CLUSTER_ID" \
+# ── Resolve endpoint ──────────────────────────────────────────────────────────
+ACTIVE_ENDPOINT=$(aws rds describe-db-clusters \
+  --db-cluster-identifier "$ACTIVE_CLUSTER" \
   --region "$AWS_REGION" \
   --query 'DBClusters[0].Endpoint' \
-  --output text) || die "Failed to describe new cluster $NEW_CLUSTER_ID"
+  --output text) || die "Failed to describe cluster $ACTIVE_CLUSTER"
 
-OLD_ENDPOINT=$(aws rds describe-db-clusters \
-  --db-cluster-identifier "$OLD_CLUSTER_ID" \
-  --region "$AWS_REGION" \
-  --query 'DBClusters[0].Endpoint' \
-  --output text) || die "Failed to describe old cluster $OLD_CLUSTER_ID"
+[[ -z "$ACTIVE_ENDPOINT" || "$ACTIVE_ENDPOINT" == "None" ]] && die "Could not resolve endpoint for $ACTIVE_CLUSTER"
+log "  Endpoint: $ACTIVE_ENDPOINT"
 
-[[ -z "$NEW_ENDPOINT" || "$NEW_ENDPOINT" == "None" ]] && die "Could not resolve endpoint for $NEW_CLUSTER_ID"
-[[ -z "$OLD_ENDPOINT" || "$OLD_ENDPOINT" == "None" ]] && die "Could not resolve endpoint for $OLD_CLUSTER_ID"
-
-log "  New prod endpoint: $NEW_ENDPOINT"
-log "  Old blue endpoint: $OLD_ENDPOINT"
-
-# ── Step 2: Fetch DB credentials from Secrets Manager ─────────────────────────
-log "Fetching DB credentials from Secrets Manager: $DB_SECRET_NAME"
+# ── Fetch credentials ─────────────────────────────────────────────────────────
 SECRET_JSON=$(aws secretsmanager get-secret-value \
   --secret-id "$DB_SECRET_NAME" \
   --region "$AWS_REGION" \
@@ -84,38 +64,29 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
   --output text) || die "Failed to fetch secret $DB_SECRET_NAME"
 
 DB_USER=$(echo "$SECRET_JSON" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
+import sys, json; d = json.load(sys.stdin)
 print(d.get('username', d.get('user', 'admin')))
-" 2>/dev/null) || die "Could not parse username from Secrets Manager JSON"
+" 2>/dev/null) || DB_USER="admin"
 
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('password', d.get('masterpassword', d.get('MYSQL_ROOT_PASSWORD', next(iter(d.values()))))))
-" 2>/dev/null) || die "Could not parse password from Secrets Manager JSON"
+import sys, json; d = json.load(sys.stdin)
+print(d.get('password', d.get('masterpassword', next(iter(d.values())))))
+" 2>/dev/null) || die "Could not parse password from secret"
 
 [[ -z "$DB_PASS" ]] && die "Empty password from Secrets Manager"
-[[ -z "$DB_USER" ]] && DB_USER="admin"
 
-# ── Step 3: Build MySQL script for bastion ────────────────────────────────────
-if [[ "$PROXY_ACTIVE" == "old" ]]; then
-  # Proxy just flipped to old blue. Promote old blue, set up reverse replication.
-  REMOTE_SCRIPT=$(cat <<SCRIPT
+# ── Build promote script ──────────────────────────────────────────────────────
+REMOTE_SCRIPT=$(cat <<SCRIPT
 #!/bin/bash
 set -euo pipefail
 
-OLD_ENDPOINT='${OLD_ENDPOINT}'
-NEW_ENDPOINT='${NEW_ENDPOINT}'
+ENDPOINT='${ACTIVE_ENDPOINT}'
 DB_PORT='${DB_PORT}'
 DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 
 mysql_exec() {
-  local host="\$1"; shift
-  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
-  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
-  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
+  mysql -h "\$ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
 
 if ! command -v mysql &>/dev/null; then
@@ -123,149 +94,52 @@ if ! command -v mysql &>/dev/null; then
   sudo yum install -y mariadb 2>/dev/null || \
   sudo apt-get install -y mysql-client 2>/dev/null || true
 fi
-command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
+command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available"; exit 1; }
 
-echo "[bastion] Stopping replication on old blue (\$OLD_ENDPOINT)..."
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
-echo "[bastion] Replication stop attempted on old blue."
+echo "[bastion] Stopping any replication on \$ENDPOINT..."
+mysql_exec "CALL mysql.rds_stop_replication();" 2>/dev/null || true
 
-echo "[bastion] Promoting old blue to read-write..."
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
-RO_OLD=\$(mysql_exec "\$OLD_ENDPOINT" "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
-if [[ "\$RO_OLD" == "1" ]]; then
-  echo "[bastion] ERROR: old blue is still read-only after rds_set_read_write — manual intervention required."
+echo "[bastion] Promoting to read-write..."
+mysql_exec "CALL mysql.rds_set_read_write();" 2>/dev/null || true
+
+RO=\$(mysql_exec "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
+if [[ "\$RO" == "1" ]]; then
+  echo "[bastion] ERROR: cluster is still read-only after rds_set_read_write"
   exit 1
 fi
-echo "[bastion] Old blue is read-write (confirmed: read_only=\$RO_OLD)."
-
-echo "[bastion] Getting new prod binlog position (\$NEW_ENDPOINT)..."
-MASTER_STATUS=\$(mysql_exec "\$NEW_ENDPOINT" "SHOW MASTER STATUS\G")
-BINLOG_FILE=\$(echo "\$MASTER_STATUS" | grep "File:" | awk '{print \$2}')
-BINLOG_POS=\$(echo "\$MASTER_STATUS" | grep "Position:" | awk '{print \$2}')
-echo "[bastion] Binlog: file=\$BINLOG_FILE pos=\$BINLOG_POS"
-
-# Idempotency: skip if already replicating from new prod
-CURRENT_MASTER=\$(mysql_exec "\$OLD_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-  | grep "Master_Host:" | awk '{print \$2}' || echo "")
-if [[ "\$CURRENT_MASTER" == "\$NEW_ENDPOINT" ]]; then
-  echo "[bastion] Already replicating from new prod — skipping setup."
-else
-  echo "[bastion] Setting up reverse replication: old blue → new prod..."
-  mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_set_external_master('\$NEW_ENDPOINT', \$DB_PORT, '\$DB_USER', '\$DB_PASS', '\$BINLOG_FILE', \$BINLOG_POS, 0);"
-  mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_start_replication();"
-  echo "[bastion] Reverse replication started: old blue → new prod."
-fi
-
-echo "[bastion] Post-flip (rollback) complete."
-echo "[bastion]   Active: OLD cluster (\$OLD_ENDPOINT)"
-echo "[bastion]   Replication: old blue → new prod (new prod stays in sync for re-promote)"
+echo "[bastion] Cluster is read-write (read_only=\$RO). Done."
 SCRIPT
 )
 
-elif [[ "$PROXY_ACTIVE" == "new" ]]; then
-  # Proxy just flipped back to new prod. Promote new prod, stop reverse replication.
-  REMOTE_SCRIPT=$(cat <<SCRIPT
-#!/bin/bash
-set -euo pipefail
-
-OLD_ENDPOINT='${OLD_ENDPOINT}'
-NEW_ENDPOINT='${NEW_ENDPOINT}'
-DB_PORT='${DB_PORT}'
-DB_USER='${DB_USER}'
-DB_PASS='${DB_PASS}'
-
-mysql_exec() {
-  local host="\$1"; shift
-  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
-  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
-  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
-}
-
-if ! command -v mysql &>/dev/null; then
-  sudo dnf install -y mariadb105 2>/dev/null || \
-  sudo yum install -y mariadb 2>/dev/null || \
-  sudo apt-get install -y mysql-client 2>/dev/null || true
-fi
-command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
-
-echo "[bastion] Stopping replication on new prod (\$NEW_ENDPOINT)..."
-mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
-echo "[bastion] Replication stop attempted on new prod."
-
-echo "[bastion] Promoting new prod to read-write..."
-mysql_exec "\$NEW_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
-RO_NEW=\$(mysql_exec "\$NEW_ENDPOINT" "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
-if [[ "\$RO_NEW" == "1" ]]; then
-  echo "[bastion] ERROR: new prod is still read-only after rds_set_read_write — manual intervention required."
-  exit 1
-fi
-echo "[bastion] New prod is read-write (confirmed: read_only=\$RO_NEW)."
-
-echo "[bastion] Stopping reverse replication on old blue (\$OLD_ENDPOINT)..."
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_stop_replication();" 2>/dev/null || true
-mysql_exec "\$OLD_ENDPOINT" "CALL mysql.rds_reset_external_master();" 2>/dev/null || true
-echo "[bastion] Old blue replication stopped."
-
-echo "[bastion] Post-flip (re-promote) complete."
-echo "[bastion]   Active: NEW cluster (\$NEW_ENDPOINT)"
-echo "[bastion]   Old blue is idle — delete with delete_old_cluster=true when ready."
-SCRIPT
-)
-
-else
-  die "Unexpected PROXY_ACTIVE value: '$PROXY_ACTIVE' (expected 'new' or 'old')"
-fi
-
-# ── Step 4: Base64-encode and send to bastion via SSM ────────────────────────
-log "Sending script to bastion via SSM..."
+# ── Send via SSM ──────────────────────────────────────────────────────────────
+log "Sending promote script to bastion via SSM..."
 ENCODED=$(echo "$REMOTE_SCRIPT" | base64 | tr -d '\n')
-
-SSM_INPUT=$(python3 -c "
-import json
-print(json.dumps({
-  'InstanceIds': ['${BASTION_INSTANCE_ID}'],
-  'DocumentName': 'AWS-RunShellScript',
-  'Parameters': {'commands': ['echo ${ENCODED} | base64 -d | bash']},
-  'TimeoutSeconds': 300
-}))
-")
 
 CMD_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
-  --cli-input-json "$SSM_INPUT" \
+  --instance-ids "$BASTION_INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters "commands=[\"echo ${ENCODED} | base64 -d | bash\"]" \
+  --timeout-seconds 120 \
   --output text \
   --query "Command.CommandId") || die "Failed to send SSM command"
 
-log "SSM command sent: $CMD_ID — polling for completion..."
+log "SSM command sent: $CMD_ID — polling..."
 
-# ── Step 5: Poll SSM until completion ────────────────────────────────────────
 while true; do
   RESULT=$(aws ssm get-command-invocation \
-    --command-id "$CMD_ID" \
-    --instance-id "$BASTION_INSTANCE_ID" \
-    --region "$AWS_REGION" \
-    --output json 2>/dev/null || echo '{"Status":"Pending"}')
-
+    --command-id "$CMD_ID" --instance-id "$BASTION_INSTANCE_ID" \
+    --region "$AWS_REGION" --output json 2>/dev/null || echo '{"Status":"Pending"}')
   STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Status','Pending'))")
-
   case "$STATUS" in
     Success)
-      OUTPUT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('StandardOutputContent',''))")
-      log "Post-proxy-flip operations completed successfully."
-      echo "$OUTPUT" | sed 's/^/  /' >&2
-      exit 0
-      ;;
+      echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('StandardOutputContent',''))" | sed 's/^/  /' >&2
+      log "Promotion complete."
+      exit 0 ;;
     Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut)
-      STDOUT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardOutputContent',''))")
-      STDERR=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardErrorContent',''))")
-      log "Script failed on bastion (status=$STATUS):"
-      echo "$STDOUT" | sed 's/^/  [stdout] /' >&2
-      echo "$STDERR" | sed 's/^/  [stderr] /' >&2
-      exit 1
-      ;;
-    *)
-      log "SSM status: $STATUS — waiting..."
-      sleep 5
-      ;;
+      echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardOutputContent',''))" | sed 's/^/  [stdout] /' >&2
+      echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardErrorContent',''))" | sed 's/^/  [stderr] /' >&2
+      die "Bastion script failed (status=$STATUS)" ;;
+    *) log "SSM status: $STATUS — waiting..."; sleep 5 ;;
   esac
 done

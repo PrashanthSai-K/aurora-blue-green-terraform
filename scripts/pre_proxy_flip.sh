@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
 # scripts/pre_proxy_flip.sh
 #
-# Phase 1 of the zero-data-loss proxy flip sequence.
-# Runs on the TERRAFORM HOST — uses SSM to execute MySQL commands on the bastion.
-# The bastion is in the VPC and has MySQL connectivity to Aurora.
+# Zero-data-loss pre-flight check before flipping the RDS Proxy.
+# Called as a GitHub Actions step — sets the current active cluster read-only
+# and waits for the target cluster's replication lag to reach zero.
 #
-# When proxy_active_cluster → "old" (rollback):
-#   1. Resolve Aurora cluster endpoints (AWS API — no VPC needed)
-#   2. Fetch DB password from Secrets Manager (AWS API)
-#   3. Send MySQL script to bastion via SSM:
-#      a. SET GLOBAL read_only = 1 on SOURCE (new prod)
-#      b. Poll SHOW SLAVE STATUS on TARGET until Seconds_Behind_Master = 0
-#   4. Poll SSM until success
-#   5. On failure: sends restore script to set SOURCE back to read-write
+#   PROXY_ACTIVE=old (rollback):
+#     SOURCE = new prod  → set read-only
+#     TARGET = old blue  → wait until Seconds_Behind_Master = 0
 #
-# When proxy_active_cluster → "new" (re-promote): exits 0 immediately — no pre-check needed.
+#   PROXY_ACTIVE=new (repromote):
+#     SOURCE = old blue  → set read-only
+#     TARGET = new prod  → wait until Seconds_Behind_Master = 0
+#     If TARGET is not replicating, warns and skips the lag wait.
 #
-# Required env vars (set by null_resource.pre_proxy_flip in blue_green.tf):
-#   PROXY_ACTIVE          "new" or "old"
+# Required env vars:
+#   PROXY_ACTIVE          "new" or "old" (destination — where we're flipping TO)
 #   OLD_CLUSTER_ID        old blue cluster identifier
 #   NEW_CLUSTER_ID        current production cluster identifier
 #   AWS_REGION
-#   DB_SECRET_NAME        Secrets Manager secret name for master password
-#   BASTION_INSTANCE_ID   EC2 instance ID of the bastion (must have SSM agent + AmazonSSMManagedInstanceCore)
+#   DB_SECRET_NAME        Secrets Manager secret ARN for master credentials
+#   BASTION_INSTANCE_ID   EC2 instance ID of the bastion
 #
 # Optional:
 #   MAX_LAG_WAIT_SEC   seconds to wait for lag=0 (default 300)
@@ -30,7 +28,7 @@
 
 set -euo pipefail
 
-PROXY_ACTIVE="${PROXY_ACTIVE:-new}"
+PROXY_ACTIVE="${PROXY_ACTIVE:-}"
 OLD_CLUSTER_ID="${OLD_CLUSTER_ID:-}"
 NEW_CLUSTER_ID="${NEW_CLUSTER_ID:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -39,72 +37,67 @@ BASTION_INSTANCE_ID="${BASTION_INSTANCE_ID:-}"
 MAX_LAG_WAIT_SEC="${MAX_LAG_WAIT_SEC:-300}"
 DB_PORT="${DB_PORT:-3306}"
 
-log()  { echo "[pre_proxy_flip]  $*" >&2; }
-die()  { log "ERROR: $*"; exit 1; }
+log() { echo "[pre_proxy_flip] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
 
-# ── No pre-check needed when flipping back to new ────────────────────────────
-if [[ "$PROXY_ACTIVE" == "new" ]]; then
-  log "Flipping proxy to new cluster — no pre-flight required. Exiting."
-  exit 0
+[[ -z "$PROXY_ACTIVE" ]]        && die "PROXY_ACTIVE is not set."
+[[ -z "$OLD_CLUSTER_ID" ]]      && die "OLD_CLUSTER_ID is not set."
+[[ -z "$NEW_CLUSTER_ID" ]]      && die "NEW_CLUSTER_ID is not set."
+[[ -z "$DB_SECRET_NAME" ]]      && die "DB_SECRET_NAME is not set."
+[[ -z "$BASTION_INSTANCE_ID" ]] && die "BASTION_INSTANCE_ID is not set."
+
+# SOURCE = cluster being set read-only (currently active, receiving writes)
+# TARGET = cluster being promoted (currently replica, we wait for its lag=0)
+if [[ "$PROXY_ACTIVE" == "old" ]]; then
+  SOURCE_CLUSTER="$NEW_CLUSTER_ID"
+  TARGET_CLUSTER="$OLD_CLUSTER_ID"
+  log "Pre-flight for rollback (proxy → old)"
+  log "  Source (→ read-only): $SOURCE_CLUSTER"
+  log "  Target (wait lag=0):  $TARGET_CLUSTER"
+elif [[ "$PROXY_ACTIVE" == "new" ]]; then
+  SOURCE_CLUSTER="$OLD_CLUSTER_ID"
+  TARGET_CLUSTER="$NEW_CLUSTER_ID"
+  log "Pre-flight for repromote (proxy → new)"
+  log "  Source (→ read-only): $SOURCE_CLUSTER"
+  log "  Target (wait lag=0):  $TARGET_CLUSTER"
+else
+  die "Unexpected PROXY_ACTIVE value: '$PROXY_ACTIVE' (expected 'new' or 'old')"
 fi
 
-# ── Validate inputs ───────────────────────────────────────────────────────────
-[[ -z "$OLD_CLUSTER_ID" ]]        && die "OLD_CLUSTER_ID is not set. Has forward switchover completed?"
-[[ -z "$NEW_CLUSTER_ID" ]]        && die "NEW_CLUSTER_ID is not set."
-[[ -z "$DB_SECRET_NAME" ]]        && die "DB_SECRET_NAME is not set."
-[[ -z "$BASTION_INSTANCE_ID" ]]   && die "BASTION_INSTANCE_ID is not set. Add it to terraform.tfvars."
-
-log "Starting pre-proxy-flip checks for rollback (proxy → old)"
-log "  Source (will go read-only): $NEW_CLUSTER_ID"
-log "  Target (old blue, checking lag): $OLD_CLUSTER_ID"
 log "  Bastion: $BASTION_INSTANCE_ID"
 
-# ── Step 1: Resolve endpoints (AWS API — runs on Terraform host) ──────────────
-log "Resolving Aurora endpoints via AWS API..."
-
+# ── Resolve endpoints ─────────────────────────────────────────────────────────
+log "Resolving Aurora endpoints..."
 SOURCE_ENDPOINT=$(aws rds describe-db-clusters \
-  --db-cluster-identifier "$NEW_CLUSTER_ID" \
-  --region "$AWS_REGION" \
-  --query 'DBClusters[0].Endpoint' \
-  --output text) || die "Failed to describe source cluster $NEW_CLUSTER_ID"
-
+  --db-cluster-identifier "$SOURCE_CLUSTER" --region "$AWS_REGION" \
+  --query 'DBClusters[0].Endpoint' --output text) || die "Failed to describe $SOURCE_CLUSTER"
 TARGET_ENDPOINT=$(aws rds describe-db-clusters \
-  --db-cluster-identifier "$OLD_CLUSTER_ID" \
-  --region "$AWS_REGION" \
-  --query 'DBClusters[0].Endpoint' \
-  --output text) || die "Failed to describe target cluster $OLD_CLUSTER_ID"
+  --db-cluster-identifier "$TARGET_CLUSTER" --region "$AWS_REGION" \
+  --query 'DBClusters[0].Endpoint' --output text) || die "Failed to describe $TARGET_CLUSTER"
 
-[[ -z "$SOURCE_ENDPOINT" || "$SOURCE_ENDPOINT" == "None" ]] && die "Could not resolve source endpoint for $NEW_CLUSTER_ID"
-[[ -z "$TARGET_ENDPOINT" || "$TARGET_ENDPOINT" == "None" ]] && die "Could not resolve target endpoint for $OLD_CLUSTER_ID"
-
+[[ -z "$SOURCE_ENDPOINT" || "$SOURCE_ENDPOINT" == "None" ]] && die "No endpoint for $SOURCE_CLUSTER"
+[[ -z "$TARGET_ENDPOINT" || "$TARGET_ENDPOINT" == "None" ]] && die "No endpoint for $TARGET_CLUSTER"
 log "  Source endpoint: $SOURCE_ENDPOINT"
 log "  Target endpoint: $TARGET_ENDPOINT"
 
-# ── Step 2: Fetch DB password from Secrets Manager (runs on Terraform host) ──
-log "Fetching DB password from Secrets Manager: $DB_SECRET_NAME"
+# ── Fetch credentials ─────────────────────────────────────────────────────────
 SECRET_JSON=$(aws secretsmanager get-secret-value \
-  --secret-id "$DB_SECRET_NAME" \
-  --region "$AWS_REGION" \
-  --query SecretString \
-  --output text) || die "Failed to fetch secret $DB_SECRET_NAME"
+  --secret-id "$DB_SECRET_NAME" --region "$AWS_REGION" \
+  --query SecretString --output text) || die "Failed to fetch secret $DB_SECRET_NAME"
 
 DB_USER=$(echo "$SECRET_JSON" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
+import sys, json; d = json.load(sys.stdin)
 print(d.get('username', d.get('user', 'admin')))
-" 2>/dev/null) || die "Could not parse username from Secrets Manager JSON"
+" 2>/dev/null) || DB_USER="admin"
 
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('password', d.get('masterpassword', d.get('MYSQL_ROOT_PASSWORD', next(iter(d.values()))))))
-" 2>/dev/null) || die "Could not parse password from Secrets Manager JSON"
+import sys, json; d = json.load(sys.stdin)
+print(d.get('password', d.get('masterpassword', next(iter(d.values())))))
+" 2>/dev/null) || die "Could not parse password from secret"
 
 [[ -z "$DB_PASS" ]] && die "Empty password from Secrets Manager"
-[[ -z "$DB_USER" ]] && DB_USER="admin"
 
-# ── Step 3: Build the MySQL script to run on the bastion ─────────────────────
-# Inject resolved values — bastion only needs MySQL client, not AWS access.
+# ── Build pre-flight script for bastion ──────────────────────────────────────
 REMOTE_SCRIPT=$(cat <<SCRIPT
 #!/bin/bash
 set -euo pipefail
@@ -115,28 +108,38 @@ DB_PORT='${DB_PORT}'
 DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 MAX_LAG_WAIT_SEC='${MAX_LAG_WAIT_SEC}'
+PROXY_ACTIVE='${PROXY_ACTIVE}'
 
 mysql_exec() {
   local host="\$1"; shift
-  # No --ssl-mode: MariaDB 10.5 SSL handshake is incompatible with Aurora MySQL 8.0 TLS.
-  # Bastion is in the VPC — plaintext within the private subnet is acceptable.
   mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
 }
 
-# Install mysql client if missing (Amazon Linux 2023 ships mariadb105, not mysql)
 if ! command -v mysql &>/dev/null; then
   sudo dnf install -y mariadb105 2>/dev/null || \
   sudo yum install -y mariadb 2>/dev/null || \
   sudo apt-get install -y mysql-client 2>/dev/null || true
 fi
-command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available after install attempt"; exit 1; }
+command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available"; exit 1; }
+
+# For repromote: check if target is actually replicating before waiting
+if [[ "\$PROXY_ACTIVE" == "new" ]]; then
+  LAG_CHECK=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
+    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || echo "")
+  if [[ -z "\$LAG_CHECK" || "\$LAG_CHECK" == "NULL" ]]; then
+    echo "[bastion] WARN: target (\$TARGET_ENDPOINT) is not replicating — skipping lag wait."
+    echo "[bastion] TIP: run bg-03 enable-replication after rollback to set up replication for zero-lag repromote."
+    echo "[bastion] Pre-flight complete (no replication active)."
+    exit 0
+  fi
+fi
 
 echo "[bastion] Setting source (\$SOURCE_ENDPOINT) to read-only..."
 mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_only();" || {
-  echo "[bastion] ERROR: Failed to set read_only on source. Check MySQL connectivity."
+  echo "[bastion] ERROR: Failed to set read-only on source."
   exit 1
 }
-echo "[bastion] Source is now read-only."
+echo "[bastion] Source is read-only."
 
 echo "[bastion] Polling replication lag on target (\$TARGET_ENDPOINT)..."
 STARTED=\$(date +%s)
@@ -149,9 +152,9 @@ while true; do
     exit 1
   fi
   LAG=\$(mysql_exec "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" 2>/dev/null \
-    | grep "Seconds_Behind_Master:" | awk '{print \$2}')
+    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || echo "NULL")
   if [[ "\$LAG" == "0" ]]; then
-    echo "[bastion] Replication lag = 0. Ready for proxy flip."
+    echo "[bastion] Replication lag = 0. Ready to flip proxy."
     exit 0
   fi
   echo "[bastion] Lag: \${LAG:-unknown}s (elapsed: \${ELAPSED}s) — waiting..."
@@ -160,56 +163,35 @@ done
 SCRIPT
 )
 
-# ── Step 4: Base64-encode and send to bastion via SSM ────────────────────────
-log "Sending script to bastion via SSM..."
+# ── Send via SSM ──────────────────────────────────────────────────────────────
+log "Sending pre-flight script to bastion via SSM..."
 ENCODED=$(echo "$REMOTE_SCRIPT" | base64 | tr -d '\n')
-
-SSM_INPUT=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'InstanceIds': ['${BASTION_INSTANCE_ID}'],
-  'DocumentName': 'AWS-RunShellScript',
-  'Parameters': {'commands': ['echo ${ENCODED} | base64 -d | bash']},
-  'TimeoutSeconds': $((MAX_LAG_WAIT_SEC + 60))
-}))
-")
 
 CMD_ID=$(aws ssm send-command \
   --region "$AWS_REGION" \
-  --cli-input-json "$SSM_INPUT" \
+  --instance-ids "$BASTION_INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters "commands=[\"echo ${ENCODED} | base64 -d | bash\"]" \
+  --timeout-seconds $((MAX_LAG_WAIT_SEC + 60)) \
   --output text \
   --query "Command.CommandId") || die "Failed to send SSM command"
 
-log "SSM command sent: $CMD_ID — polling for completion..."
+log "SSM command sent: $CMD_ID — polling..."
 
-# ── Step 5: Poll SSM until completion ────────────────────────────────────────
 while true; do
   RESULT=$(aws ssm get-command-invocation \
-    --command-id "$CMD_ID" \
-    --instance-id "$BASTION_INSTANCE_ID" \
-    --region "$AWS_REGION" \
-    --output json 2>/dev/null || echo '{"Status":"Pending"}')
-
+    --command-id "$CMD_ID" --instance-id "$BASTION_INSTANCE_ID" \
+    --region "$AWS_REGION" --output json 2>/dev/null || echo '{"Status":"Pending"}')
   STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Status','Pending'))")
-
   case "$STATUS" in
     Success)
-      OUTPUT=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('StandardOutputContent',''))")
-      log "Pre-proxy-flip checks passed."
-      echo "$OUTPUT" | sed 's/^/  [bastion] /' >&2
-      exit 0
-      ;;
+      echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('StandardOutputContent',''))" | sed 's/^/  /' >&2
+      log "Pre-flight checks passed."
+      exit 0 ;;
     Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut)
-      STDOUT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardOutputContent',''))")
-      STDERR=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardErrorContent',''))")
-      log "Script failed on bastion (status=$STATUS):"
-      echo "$STDOUT" | sed 's/^/  [stdout] /' >&2
-      echo "$STDERR" | sed 's/^/  [stderr] /' >&2
-      exit 1
-      ;;
-    *)
-      log "SSM status: $STATUS — waiting..."
-      sleep 5
-      ;;
+      echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardOutputContent',''))" | sed 's/^/  [stdout] /' >&2
+      echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('StandardErrorContent',''))" | sed 's/^/  [stderr] /' >&2
+      die "Pre-flight failed (status=$STATUS)" ;;
+    *) log "SSM status: $STATUS — waiting..."; sleep 5 ;;
   esac
 done

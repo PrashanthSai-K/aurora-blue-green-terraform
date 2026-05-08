@@ -217,12 +217,6 @@ variable "retain_old_cluster" {
   default     = true
 }
 
-variable "enable_reverse_replication" {
-  description = "Set up binlog replication from new production (green) back to old blue cluster for rollback readiness."
-  type        = bool
-  default     = false
-}
-
 variable "old_blue_cluster_id" {
   description = "Set this once after forward switchover (value from terraform output old_blue_cluster_id). Used by the proxy flip scripts."
   type        = string
