@@ -663,27 +663,16 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		}
 	}
 
-	// ── Section 3: Delete B/G deployment object + old cluster ───────────────
-	// Runs automatically after switchover succeeds. Deletes the AWS B/G deployment
-	// record AND the old blue cluster in one step.
+	// ── Section 3: Delete B/G deployment object ──────────────────────────────
+	// Runs automatically after switchover succeeds. Deletes only the AWS B/G
+	// deployment record — the old blue cluster is intentionally retained in state
+	// (old_source_cluster_id) so that name-swap rollback (Section 4) remains
+	// available. The old cluster is cleaned up either by trigger_rollback +
+	// delete_cluster_after_rollback, or explicitly via the bg-06 workflow.
 	if state.Status.ValueString() == bgStatusSwitchoverCompleted && !state.DeploymentDeleted.ValueBool() {
-		oldClusterID := state.OldSourceClusterID.ValueString()
-
-		// Delete old blue cluster first.
-		if oldClusterID != "" {
-			tflog.Info(ctx, "Post-switchover: deleting old blue cluster", map[string]any{
-				"old_cluster_id": oldClusterID,
-			})
-			resp.Diagnostics.Append(r.deleteClusterAndInstances(ctx, oldClusterID)...)
-			if resp.Diagnostics.HasError() {
-				return
-			}
-			state.OldSourceClusterID = types.StringNull()
-		}
-
-		// Delete the B/G deployment object (keeps new prod cluster intact).
-		tflog.Info(ctx, "Post-switchover: deleting B/G deployment object", map[string]any{
-			"deployment_id": deploymentID,
+		tflog.Info(ctx, "Post-switchover: deleting B/G deployment object (old cluster retained for rollback)", map[string]any{
+			"deployment_id":      deploymentID,
+			"old_source_cluster": state.OldSourceClusterID.ValueString(),
 		})
 		_, err := r.clients.RDS.DeleteBlueGreenDeployment(ctx, &rds.DeleteBlueGreenDeploymentInput{
 			BlueGreenDeploymentIdentifier: aws.String(deploymentID),
@@ -701,7 +690,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		tflog.Info(ctx, "Post-switchover cleanup complete — B/G deployment and old cluster deleted")
+		tflog.Info(ctx, "Post-switchover: B/G deployment object deleted — old cluster still available for rollback")
 	}
 
 	// ── Section 4: Name-swap rollback ────────────────────────────────────────

@@ -1,22 +1,24 @@
-name: "Blue-Green | 6. Delete Old Cluster"
+name: "Blue-Green | 6. Delete Old Cluster (Happy Path)"
 
-# Phase 6 (cleanup): Permanently deletes the old blue cluster.
+# Cleanup: permanently deletes the old blue cluster after a successful switchover
+# when NO rollback is needed.
 #
-# All required values are read from Terraform state — no manual inputs needed.
+# Use this when you have confirmed production is stable on the new cluster and
+# you no longer need the old blue cluster for rollback.
+#
+# If you DID roll back (trigger_rollback=true was applied), use bg-03 with
+# action=delete-cluster-after-rollback instead — that deletes the -new1 cluster.
 #
 # SAFETY guards:
-#   1. Type DELETE to confirm (irreversible action)
-#   2. Workflow checks proxy is NOT on old cluster before proceeding
-#   3. Provider enforces same guard — refuses if proxy_active_cluster = "old"
-#
-# If you rolled back and want to delete the NEW cluster instead, run bg-05-rollback-new
-# first to move traffic back to new, then come back here.
+#   1. Type DELETE to confirm (irreversible)
+#   2. Reads old_blue_cluster_id from Terraform state — no manual input needed
+#   3. Verifies the cluster still exists before attempting deletion
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type DELETE to confirm — permanently deletes the old cluster'
+        description: 'Type DELETE to confirm — permanently deletes the old blue cluster'
         required: true
         default: ''
       project_name:
@@ -49,7 +51,7 @@ jobs:
   delete-old:
     name: "Delete Old Blue Cluster"
     runs-on: ubuntu-latest
-    environment: aurora-test
+    environment: aurora-test   # ← approval gate
 
     steps:
       - name: Confirm intent
@@ -78,78 +80,91 @@ jobs:
 
       - name: Write variable overrides
         run: |
-          # Must match the values used in aurora-deploy for this environment.
           cat > /tmp/override.tfvars << EOF
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
           environment         = "${{ inputs.environment }}"
-          rds_proxy_name      = "${{ inputs.project_name }}-proxy"
           iam_role_name       = "${{ inputs.project_name }}-readonly-role"
           iam_policy_name     = "${{ inputs.project_name }}-readonly-policy"
           okta_app_name       = "${{ inputs.project_name }}-app"
           okta_group_name     = "${{ inputs.project_name }}-readonly-users"
           EOF
 
-      - name: Read required values from state
+      - name: Read old cluster ID from state
         id: state
         run: |
-          CURRENT_PROXY=$(terraform output -raw proxy_active_cluster 2>/dev/null || echo "new")
           OLD_ID=$(terraform output -raw old_blue_cluster_id 2>/dev/null || echo "")
-          BASTION=$(terraform output -raw bastion_instance_id 2>/dev/null || echo "")
-
-          if [ "$CURRENT_PROXY" = "old" ]; then
-            echo "ERROR: Cannot delete old cluster — proxy is routing traffic to it."
-            echo "Run bg-05-rollback-new first."
-            exit 1
-          fi
           if [ -z "$OLD_ID" ] || [ "$OLD_ID" = "null" ]; then
-            echo "INFO: old_blue_cluster_id is empty — old cluster may already be gone."
+            echo "INFO: old_blue_cluster_id is empty — old cluster may already be deleted."
+            exit 0
+          fi
+
+          # Verify cluster still exists in AWS before attempting deletion.
+          STATUS=$(aws rds describe-db-clusters \
+            --db-cluster-identifier "$OLD_ID" \
+            --query "DBClusters[0].Status" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ] || [ "$STATUS" = "None" ]; then
+            echo "INFO: Cluster $OLD_ID not found in AWS — already deleted."
             exit 0
           fi
 
           echo "old_cluster_id=$OLD_ID" >> $GITHUB_OUTPUT
-          echo "bastion_id=$BASTION"    >> $GITHUB_OUTPUT
-          echo "Will delete: $OLD_ID (proxy is on: $CURRENT_PROXY)"
+          echo "Will delete cluster: $OLD_ID (current status: $STATUS)"
 
-      - name: Terraform Plan — Delete Old Cluster
+      - name: Delete all instances in old cluster
+        if: steps.state.outputs.old_cluster_id != ''
         run: |
-          terraform plan \
-            -var-file="terraform.tfvars" \
-            -var-file="/tmp/override.tfvars" \
-            -var="enable_blue_green=true" \
-            -var="trigger_switchover=true" \
-            -var="delete_old_cluster=true" \
-            -var="old_blue_cluster_id=${{ steps.state.outputs.old_cluster_id }}" \
-            -var="bastion_instance_id=${{ steps.state.outputs.bastion_id }}" \
-            -out=tfplan \
-            2>&1 | tee /tmp/plan-output.txt
-        env:
-          TF_VAR_okta_api_token: ${{ secrets.OKTA_API_TOKEN }}
+          OLD_ID="${{ steps.state.outputs.old_cluster_id }}"
 
-      - name: Plan Summary
+          # Get all instance IDs in the cluster.
+          INSTANCES=$(aws rds describe-db-instances \
+            --filters "Name=db-cluster-id,Values=$OLD_ID" \
+            --query "DBInstances[*].DBInstanceIdentifier" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCES" ]; then
+            for INSTANCE_ID in $INSTANCES; do
+              echo "Deleting instance: $INSTANCE_ID"
+              aws rds delete-db-instance \
+                --db-instance-identifier "$INSTANCE_ID" \
+                --skip-final-snapshot \
+                --region "${{ inputs.aws_region }}" || true
+            done
+
+            echo "Waiting for all instances to be deleted..."
+            for INSTANCE_ID in $INSTANCES; do
+              aws rds wait db-instance-deleted \
+                --db-instance-identifier "$INSTANCE_ID" \
+                --region "${{ inputs.aws_region }}" || true
+              echo "Instance $INSTANCE_ID deleted."
+            done
+          else
+            echo "No instances found in cluster $OLD_ID."
+          fi
+
+      - name: Delete old cluster
+        if: steps.state.outputs.old_cluster_id != ''
         run: |
+          OLD_ID="${{ steps.state.outputs.old_cluster_id }}"
+          echo "Deleting cluster: $OLD_ID"
+          aws rds delete-db-cluster \
+            --db-cluster-identifier "$OLD_ID" \
+            --skip-final-snapshot \
+            --region "${{ inputs.aws_region }}"
+          echo "Cluster $OLD_ID deletion initiated."
+
+      - name: Deletion summary
+        run: |
+          OLD_ID="${{ steps.state.outputs.old_cluster_id }}"
           {
-            echo "## Plan — Delete Old Cluster"
-            echo "**Target:** \`${{ steps.state.outputs.old_cluster_id }}\`"
-            echo '```'
-            tail -30 /tmp/plan-output.txt
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: Terraform Apply — Delete Old Cluster
-        run: terraform apply -auto-approve tfplan
-        env:
-          TF_VAR_okta_api_token: ${{ secrets.OKTA_API_TOKEN }}
-
-      - name: Deletion Summary
-        run: |
-          {
-            echo "## Old Cluster Deleted"
+            echo "## Old Cluster Deletion Initiated"
             echo ""
-            echo "| Deleted | \`${{ steps.state.outputs.old_cluster_id }}\` |"
+            echo "| Deleted | \`${OLD_ID:-already gone}\` |"
             echo "|---------|---|"
             echo ""
             echo "### Next Steps"
-            echo "- Set \`enable_blue_green = false\` and run **aurora-deploy** to remove the B/G deployment object"
-            echo "- Or keep \`enable_blue_green = true\` and run **bg-01-create-green** for the next upgrade cycle"
+            echo "- Set \`enable_blue_green = false\` and run **aurora-deploy** to remove the B/G resource from state"
+            echo "- Or keep \`enable_blue_green = true\` and run **bg-01-create-green** to start the next upgrade cycle"
           } >> $GITHUB_STEP_SUMMARY

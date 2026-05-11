@@ -2,10 +2,18 @@ name: "Blue-Green | 2. Switchover"
 
 # Phase 2: Promotes green to production.
 # The aurora-bluegreen provider calls SwitchoverBlueGreenDeployment, polls until
-# SWITCHOVER_COMPLETED, and writes old_blue_cluster_id to state.
+# SWITCHOVER_COMPLETED, then auto-deletes the B/G deployment object.
+# The old blue cluster is RETAINED in state (old_blue_cluster_id) for rollback.
 #
-# After apply, old_blue_cluster_id and bastion_instance_id are in Terraform state.
-# All rollback workflows read them directly — no manual IDs needed.
+# After apply:
+#   - Green cluster has taken the original cluster name/endpoint
+#   - Old blue cluster is renamed <orig>-old1 and tracked in state
+#   - B/G deployment object is deleted (deployment_deleted=true in state)
+#
+# Next options (no manual cluster IDs needed — all read from state):
+#   - Enable replication → bg-03 (enable-replication action)
+#   - Rollback if needed → bg-03 (rollback action)
+#   - Delete old cluster (happy path) → bg-06
 #
 # Flow:
 #   plan job  — pre-flight check + plan, posts summary (no approval needed)
@@ -83,7 +91,6 @@ jobs:
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
           environment         = "${{ inputs.environment }}"
-          rds_proxy_name      = "${{ inputs.project_name }}-proxy"
           iam_role_name       = "${{ inputs.project_name }}-readonly-role"
           iam_policy_name     = "${{ inputs.project_name }}-readonly-policy"
           okta_app_name       = "${{ inputs.project_name }}-app"
@@ -111,7 +118,6 @@ jobs:
             -var="trigger_switchover=true" \
             -var="green_engine_version=${{ inputs.green_engine_version }}" \
             -var="bastion_instance_id=${{ inputs.bastion_instance_id }}" \
-            -var="retain_old_cluster=true" \
             -out=tfplan \
             2>&1 | tee /tmp/plan-output.txt
         env:
@@ -200,10 +206,14 @@ jobs:
             echo "| Old Blue Cluster | \`$OLD_CLUSTER\` |"
             echo "| Bastion | \`${{ inputs.bastion_instance_id }}\` |"
             echo ""
-            echo "Both values are now in Terraform state — rollback workflows read them automatically."
+            echo "The old cluster is retained for rollback. B/G deployment object has been deleted."
             echo ""
-            echo "### Next Options"
-            echo "- **Rollback needed?** → Run **bg-04-rollback-old** (no inputs needed)"
-            echo "- **Enable replication?** → Run **bg-03-enable-replication** (no inputs needed)"
-            echo "- **Everything stable?** → Run **bg-06-delete-old** to clean up"
+            echo "### Next Steps"
+            echo "1. **Enable replication (recommended)** → Run **bg-03** with action=enable-replication"
+            echo "   Sets up new prod → old blue replication so rollback has zero data loss."
+            echo ""
+            echo "2. **If rollback needed** → Run **bg-03** with action=rollback"
+            echo "   Pre-flight checks lag, then swaps cluster names to restore original endpoint."
+            echo ""
+            echo "3. **Everything stable?** → Run **bg-06** to delete the old cluster"
           } >> $GITHUB_STEP_SUMMARY

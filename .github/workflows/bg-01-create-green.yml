@@ -79,7 +79,6 @@ jobs:
           project_name        = "${{ inputs.project_name }}"
           aurora_cluster_name = "${{ inputs.aurora_cluster_name }}"
           environment         = "${{ inputs.environment }}"
-          rds_proxy_name      = "${{ inputs.project_name }}-proxy"
           iam_role_name       = "${{ inputs.project_name }}-readonly-role"
           iam_policy_name     = "${{ inputs.project_name }}-readonly-policy"
           okta_app_name       = "${{ inputs.project_name }}-app"

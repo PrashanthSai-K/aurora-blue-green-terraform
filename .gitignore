@@ -18,3 +18,5 @@ override.tf.json
 
 # OS noise
 .DS_Store
+
+terraform-provider-aurora-bluegreen.zip

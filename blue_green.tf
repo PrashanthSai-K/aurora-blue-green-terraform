@@ -1,13 +1,16 @@
 # Blue/Green Deployment — managed by the custom aurora-bluegreen provider.
 #
-# The provider handles AWS-level operations:
-#   - Creating the green Aurora cluster (enable_blue_green=true)
-#   - Triggering switchover (trigger_switchover=true)
-#   - Flipping the RDS Proxy target (proxy_active_cluster=old|new)
-#   - Deleting the old cluster (delete_old_cluster=true)
+# Provider lifecycle:
+#   Phase 1  enable_blue_green=true                  → creates green cluster (AVAILABLE)
+#   Phase 2  trigger_switchover=true                 → production switchover; on success the
+#                                                       B/G deployment object is auto-deleted
+#                                                       and the old cluster is retained in state
+#   Rollback trigger_rollback=true                   → name-swap: new prod → <orig>-new1,
+#                                                       old blue → <orig> (original endpoint restored)
+#   Cleanup  delete_cluster_after_rollback=true      → deletes the <orig>-new1 cluster
 #
 # MySQL operations (read_only, replication) are handled entirely in GitHub Actions.
-# See bg-03-enable-replication.yml for replication setup, rollback, and re-promote.
+# See bg-03-enable-replication.yml for replication setup and rollback pre-flight.
 
 resource "aurora-bluegreen_deployment" "main" {
   count = var.enable_blue_green ? 1 : 0
@@ -20,10 +23,8 @@ resource "aurora-bluegreen_deployment" "main" {
   trigger_switchover    = var.trigger_switchover
   delete_source_cluster = var.delete_source_cluster
 
-  retain_old_cluster   = var.retain_old_cluster
-  rds_proxy_name       = var.rds_proxy_name
-  proxy_active_cluster = var.proxy_active_cluster
-  delete_old_cluster   = var.delete_old_cluster
+  trigger_rollback              = var.trigger_rollback
+  delete_cluster_after_rollback = var.delete_cluster_after_rollback
 
   create_timeout_minutes     = 90
   switchover_timeout_seconds = 300

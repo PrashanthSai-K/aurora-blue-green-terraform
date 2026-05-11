@@ -211,43 +211,26 @@ variable "delete_source_cluster" {
   default     = false
 }
 
-variable "retain_old_cluster" {
-  description = "Keep the old blue cluster after switchover (true = safe default). Set false to auto-delete it on destroy."
-  type        = bool
-  default     = true
-}
-
 variable "old_blue_cluster_id" {
-  description = "Set this once after forward switchover (value from terraform output old_blue_cluster_id). Used by the proxy flip scripts."
+  description = "Read-only: populated by the provider after switchover. Used by rollback scripts to identify the old cluster."
   type        = string
   default     = ""
 }
 
 variable "bastion_instance_id" {
-  description = "EC2 instance ID of the bastion host (e.g. i-0abc123). Must have SSM agent running and AmazonSSMManagedInstanceCore IAM policy. Used to run MySQL commands inside the VPC during proxy flips."
+  description = "EC2 instance ID of the bastion host (e.g. i-0abc123). Must have SSM agent running and AmazonSSMManagedInstanceCore IAM policy. Used to run MySQL commands inside the VPC during replication setup and rollback pre-flight."
   type        = string
   default     = ""
 }
 
-variable "proxy_active_cluster" {
-  description = "Which cluster the RDS Proxy routes traffic to: \"new\" (current production) or \"old\" (rollback to old blue). Changing triggers a proxy target flip."
-  type        = string
-  default     = "new"
-
-  validation {
-    condition     = contains(["new", "old"], var.proxy_active_cluster)
-    error_message = "proxy_active_cluster must be \"new\" or \"old\"."
-  }
-}
-
-variable "delete_old_cluster" {
-  description = "Set true to delete the old blue cluster immediately via Update() (without terraform destroy). Cannot be true when proxy_active_cluster=\"old\"."
+variable "trigger_rollback" {
+  description = "Set true to perform a name-swap rollback: renames new prod cluster to <orig>-new1 and old blue cluster back to its original name, restoring the original endpoint. Run bg-03 pre-flight first to ensure replication lag = 0."
   type        = bool
   default     = false
 }
 
-variable "rds_proxy_name" {
-  description = "RDS Proxy identifier to redirect during rollback. Required when using proxy_active_cluster."
-  type        = string
-  default     = ""
+variable "delete_cluster_after_rollback" {
+  description = "Set true after trigger_rollback completes to permanently delete the <orig>-new1 cluster. Irreversible — confirm rollback is stable before enabling."
+  type        = bool
+  default     = false
 }
