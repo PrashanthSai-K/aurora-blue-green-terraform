@@ -71,6 +71,9 @@ const (
 
 	// Suffix appended to the new prod cluster during name-swap rollback.
 	rollbackNewClusterSuffix = "-new1"
+
+	// Suffix AWS appends to the old blue cluster and instances after B/G switchover.
+	rollbackOldInstanceSuffix = "-old1"
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -698,7 +701,9 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 	//   new prod (<orig>)      → <orig>-new1
 	//   old blue (<orig>-old1) → <orig>
 	//
-	// GitHub Actions MUST run pre-flight (read-only + lag=0) before this apply.
+	// Both steps are idempotent — if a previous apply failed mid-way, re-running
+	// safely resumes from whichever step was not yet completed.
+	// GitHub Actions MUST run pre-flight (lag=0) before this apply.
 	if plan.TriggerRollback.ValueBool() && !state.RollbackCompleted.ValueBool() {
 		oldClusterID := state.OldSourceClusterID.ValueString()
 		if oldClusterID == "" {
@@ -718,14 +723,71 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 			"temp_cluster_id": newClusterTempID,
 		})
 
-		// Step 1: rename new prod → <orig>-new1 (endpoint goes dark briefly)
-		resp.Diagnostics.Append(r.renameCluster(ctx, origClusterID, newClusterTempID)...)
+		// Step 1 (idempotent): rename new prod cluster → <orig>-new1
+		// Skip if <orig>-new1 already exists — handles partial failure recovery.
+		newClusterExists, checkErr := r.clusterExists(ctx, newClusterTempID)
+		if checkErr != nil {
+			resp.Diagnostics.AddError("Failed to check cluster existence", checkErr.Error())
+			return
+		}
+		if newClusterExists {
+			tflog.Info(ctx, "Step 1 already complete — new1 cluster exists, skipping rename", map[string]any{
+				"cluster_id": newClusterTempID,
+			})
+		} else {
+			resp.Diagnostics.Append(r.renameCluster(ctx, origClusterID, newClusterTempID)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+		}
+
+		// Step 2: rename new prod instances → <instance>-new1
+		// Must happen before Step 5 so original instance names are free for the old cluster.
+		// Idempotent: instances already ending in -new1 are skipped.
+		tflog.Info(ctx, "Step 2: renaming new prod instances to -new1", map[string]any{
+			"cluster_id": newClusterTempID,
+		})
+		resp.Diagnostics.Append(r.renameInstancesOfCluster(ctx, newClusterTempID, "", rollbackNewClusterSuffix)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
-		// Step 2: rename old blue → <orig> (endpoint restored)
-		resp.Diagnostics.Append(r.renameCluster(ctx, oldClusterID, origClusterID)...)
+		// Step 3: wait for old cluster to be available before renaming it.
+		// Renaming the first cluster can briefly put the related (replicated) cluster
+		// into "modifying" — attempting Step 4 while it is modifying will return 400.
+		tflog.Info(ctx, "Step 3: waiting for old cluster to be available", map[string]any{
+			"cluster_id": oldClusterID,
+		})
+		resp.Diagnostics.Append(r.waitForClusterAvailable(ctx, oldClusterID, 10*time.Minute)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Step 4 (idempotent): rename old blue cluster → <orig>
+		// Skip if old cluster no longer exists under its old ID (already renamed on a prior run).
+		oldClusterExists, checkErr2 := r.clusterExists(ctx, oldClusterID)
+		if checkErr2 != nil {
+			resp.Diagnostics.AddError("Failed to check cluster existence", checkErr2.Error())
+			return
+		}
+		if !oldClusterExists {
+			tflog.Info(ctx, "Step 4 already complete — old cluster no longer at old ID, skipping rename", map[string]any{
+				"cluster_id": oldClusterID,
+			})
+		} else {
+			resp.Diagnostics.Append(r.renameCluster(ctx, oldClusterID, origClusterID)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+		}
+
+		// Step 5: rename old cluster instances → remove -old1 suffix (restore original names).
+		// Original instance names are now free because Step 2 moved new prod instances to -new1.
+		// Idempotent: instances that no longer have -old1 suffix are skipped.
+		tflog.Info(ctx, "Step 5: renaming old cluster instances to original names", map[string]any{
+			"cluster_id": origClusterID,
+		})
+		resp.Diagnostics.Append(r.renameInstancesOfCluster(ctx, origClusterID, rollbackOldInstanceSuffix, "")...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -1110,6 +1172,127 @@ func (r *BlueGreenDeploymentResource) waitForClusterAvailable(ctx context.Contex
 		"Timeout",
 		fmt.Sprintf("Cluster %s did not become available within %s after rename", clusterID, timeout),
 	)
+	return diags
+}
+
+// clusterExists returns true if the cluster exists in AWS (any status), false if not found.
+func (r *BlueGreenDeploymentResource) clusterExists(ctx context.Context, clusterID string) (bool, error) {
+	_, err := r.clients.RDS.DescribeDBClusters(ctx, &rds.DescribeDBClustersInput{
+		DBClusterIdentifier: aws.String(clusterID),
+	})
+	if err != nil {
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// renameInstancesOfCluster renames every instance in a cluster by stripping oldSuffix
+// and appending newSuffix. Idempotent: instances already at their target name are skipped.
+// Both steps of the name-swap rollback use this:
+//
+//	Step 2: oldSuffix="",      newSuffix="-new1"  (new prod instances → -new1)
+//	Step 5: oldSuffix="-old1", newSuffix=""        (old cluster instances → original names)
+func (r *BlueGreenDeploymentResource) renameInstancesOfCluster(
+	ctx context.Context, clusterID, oldSuffix, newSuffix string,
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	out, err := r.clients.RDS.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
+		Filters: []rdstypes.Filter{
+			{Name: aws.String("db-cluster-id"), Values: []string{clusterID}},
+		},
+	})
+	if err != nil {
+		if isNotFoundError(err) {
+			return diags
+		}
+		diags.AddError("Failed to list instances", fmt.Sprintf("cluster %s: %s", clusterID, err.Error()))
+		return diags
+	}
+
+	var renamedTo []string
+
+	for _, inst := range out.DBInstances {
+		currentID := awsStringValue(inst.DBInstanceIdentifier)
+
+		// Idempotency: skip if already has the target suffix (step 2 re-run).
+		if newSuffix != "" && strings.HasSuffix(currentID, newSuffix) {
+			tflog.Info(ctx, "Instance already has target suffix, skipping", map[string]any{
+				"instance_id": currentID, "suffix": newSuffix,
+			})
+			continue
+		}
+		// Idempotency: skip if the expected old suffix is not present (step 5 re-run).
+		if oldSuffix != "" && !strings.HasSuffix(currentID, oldSuffix) {
+			tflog.Info(ctx, "Instance does not have expected suffix, skipping", map[string]any{
+				"instance_id": currentID, "expected_suffix": oldSuffix,
+			})
+			continue
+		}
+
+		newID := strings.TrimSuffix(currentID, oldSuffix) + newSuffix
+
+		tflog.Info(ctx, "Renaming instance", map[string]any{"from": currentID, "to": newID})
+		_, renameErr := r.clients.RDS.ModifyDBInstance(ctx, &rds.ModifyDBInstanceInput{
+			DBInstanceIdentifier:    aws.String(currentID),
+			NewDBInstanceIdentifier: aws.String(newID),
+			ApplyImmediately:        aws.Bool(true),
+		})
+		if renameErr != nil {
+			diags.AddError(
+				"Failed to rename instance",
+				fmt.Sprintf("ModifyDBInstance %s → %s: %s", currentID, newID, renameErr.Error()),
+			)
+			return diags
+		}
+		renamedTo = append(renamedTo, newID)
+	}
+
+	// Wait for all renamed instances to be available under their new identifiers.
+	for _, newID := range renamedTo {
+		tflog.Info(ctx, "Waiting for renamed instance to be available", map[string]any{"instance_id": newID})
+		diags.Append(r.waitForInstanceAvailable(ctx, newID, 15*time.Minute)...)
+		if diags.HasError() {
+			return diags
+		}
+	}
+
+	return diags
+}
+
+// waitForInstanceAvailable polls DescribeDBInstances until the instance is available.
+func (r *BlueGreenDeploymentResource) waitForInstanceAvailable(
+	ctx context.Context, instanceID string, timeout time.Duration,
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		out, err := r.clients.RDS.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
+			DBInstanceIdentifier: aws.String(instanceID),
+		})
+		if err == nil && len(out.DBInstances) > 0 {
+			status := awsStringValue(out.DBInstances[0].DBInstanceStatus)
+			tflog.Info(ctx, "Polling instance availability", map[string]any{
+				"instance_id": instanceID, "status": status,
+			})
+			if status == "available" {
+				return diags
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			diags.AddError("Context cancelled", fmt.Sprintf("cancelled while waiting for instance %s", instanceID))
+			return diags
+		case <-time.After(15 * time.Second):
+		}
+	}
+
+	diags.AddError("Timeout", fmt.Sprintf("Instance %s did not become available within %s after rename", instanceID, timeout))
 	return diags
 }
 
