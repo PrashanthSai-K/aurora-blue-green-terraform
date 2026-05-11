@@ -170,9 +170,15 @@ jobs:
         # PROXY_ACTIVE=old means we are about to switch to the old cluster.
         # The script sets the current active cluster (new prod) read-only and
         # polls until the old blue cluster's replication lag reaches 0.
+        #
+        # OLD_CLUSTER_ID is always <aurora_cluster_name>-old1 here — that is where
+        # AWS places the old blue cluster after B/G switchover, and it stays there
+        # until the rollback rename runs. Do NOT use old_blue_cluster_id from TF state;
+        # that field is overwritten to <name>-new1 at the END of rollback, so reading
+        # it here before rollback runs will give the wrong (non-existent) cluster name.
         env:
           PROXY_ACTIVE:          old
-          OLD_CLUSTER_ID:        ${{ steps.state.outputs.old_cluster_id }}
+          OLD_CLUSTER_ID:        ${{ inputs.aurora_cluster_name }}-old1
           NEW_CLUSTER_ID:        ${{ inputs.aurora_cluster_name }}
           AWS_REGION:            ${{ inputs.aws_region }}
           DB_SECRET_NAME:        ${{ steps.state.outputs.db_secret_arn }}
