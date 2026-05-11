@@ -84,6 +84,7 @@ var (
 	_ resource.Resource                = &BlueGreenDeploymentResource{}
 	_ resource.ResourceWithImportState = &BlueGreenDeploymentResource{}
 	_ resource.ResourceWithConfigure   = &BlueGreenDeploymentResource{}
+	_ resource.ResourceWithModifyPlan  = &BlueGreenDeploymentResource{}
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -170,6 +171,11 @@ type BlueGreenDeploymentModel struct {
 	// delete_cluster_after_rollback: set true (in a separate apply after rollback)
 	// to delete the <orig>-new1 cluster.
 	DeleteClusterAfterRollback types.Bool `tfsdk:"delete_cluster_after_rollback"`
+
+	// rollback_source_cluster_id: computed. Set to <orig>-new1 after Step 1 of the
+	// name-swap rollback completes. Cleared when rollback_completed becomes true.
+	// Workflows read this to detect a partial rollback and skip the pre-flight check.
+	RollbackSourceClusterID types.String `tfsdk:"rollback_source_cluster_id"`
 }
 
 var autoScalingAttrTypes = map[string]attr.Type{
@@ -382,8 +388,48 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 				Default:     booldefault.StaticBool(false),
 				Description: "Set true (in a separate apply after rollback) to delete the <orig>-new1 cluster.",
 			},
+
+			"rollback_source_cluster_id": schema.StringAttribute{
+				Computed:    true,
+				Description: "Set to <orig>-new1 after Step 1 of name-swap rollback completes. Cleared when rollback_completed is true. Workflows read this to detect a partial rollback and skip the pre-flight check on re-runs.",
+			},
 		},
 	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// ModifyPlan — mark computed fields unknown when they will change
+// ─────────────────────────────────────────────────────────────
+
+// ModifyPlan runs after attribute-level plan modifiers. When trigger_rollback is
+// true the rollback steps will overwrite old_source_cluster_id (pointing it at
+// <orig>-new1 so delete_cluster_after_rollback can find the cluster) and will
+// write rollback_source_cluster_id as a partial-progress sentinel. Marking these
+// attributes unknown tells Terraform the values will change during apply, which
+// prevents the "Provider produced inconsistent result after apply" error that
+// fires when UseStateForUnknown() has already locked in the old planned value.
+func (r *BlueGreenDeploymentResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return // destroy — nothing to mark unknown
+	}
+
+	var plan BlueGreenDeploymentModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if !plan.TriggerRollback.ValueBool() {
+		return // rollback not being triggered, no fields will change unexpectedly
+	}
+
+	// Rollback is being applied (trigger_rollback=true). The provider will:
+	//   • set old_source_cluster_id → <orig>-new1 (so delete_cluster_after_rollback works)
+	//   • set rollback_source_cluster_id → <orig>-new1 after Step 1, then "" at completion
+	// Mark both unknown so Terraform accepts whatever value the provider returns.
+	plan.OldSourceClusterID = types.StringUnknown()
+	plan.RollbackSourceClusterID = types.StringUnknown()
+	resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -446,6 +492,7 @@ func (r *BlueGreenDeploymentResource) Create(ctx context.Context, req resource.C
 	plan.TriggerRollback = types.BoolValue(false)
 	plan.RollbackCompleted = types.BoolValue(false)
 	plan.DeleteClusterAfterRollback = types.BoolValue(false)
+	plan.RollbackSourceClusterID = types.StringValue("")
 
 	// Save partial state immediately — preserves deployment_id if poll is interrupted.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -741,6 +788,15 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 			}
 		}
 
+		// Save state after Step 1 so re-runs can detect the partial rollback.
+		// rollback_source_cluster_id = aurora-github-db-new1 signals to the workflow
+		// that the original prod cluster was already renamed — skip pre-flight on re-run.
+		state.RollbackSourceClusterID = types.StringValue(newClusterTempID)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
 		// Step 2: rename new prod instances → <instance>-new1
 		// Must happen before Step 5 so original instance names are free for the old cluster.
 		// Idempotent: instances already ending in -new1 are skipped.
@@ -796,6 +852,8 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		state.OldSourceClusterID = types.StringValue(newClusterTempID)
 		state.RollbackCompleted = types.BoolValue(true)
 		state.TriggerRollback = types.BoolValue(true)
+		// Clear the partial-rollback sentinel now that rollback is fully complete.
+		state.RollbackSourceClusterID = types.StringValue("")
 
 		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 		if resp.Diagnostics.HasError() {
@@ -1016,6 +1074,7 @@ func (r *BlueGreenDeploymentResource) ImportState(ctx context.Context, req resou
 		TriggerRollback:            types.BoolValue(false),
 		RollbackCompleted:          types.BoolValue(false),
 		DeleteClusterAfterRollback: types.BoolValue(false),
+		RollbackSourceClusterID:    types.StringValue(""),
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)

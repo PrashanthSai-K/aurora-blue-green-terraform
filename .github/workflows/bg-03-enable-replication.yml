@@ -102,6 +102,9 @@ jobs:
         run: |
           OLD_ID=$(terraform output -raw old_blue_cluster_id 2>/dev/null || echo "")
           BASTION=$(terraform output -raw bastion_instance_id 2>/dev/null || echo "")
+          # rollback_source_cluster_id is set by the provider after Step 1 of name-swap.
+          # Non-empty means Step 1 already completed on a prior run — skip pre-flight.
+          ROLLBACK_SOURCE=$(terraform output -raw rollback_source_cluster_id 2>/dev/null || echo "")
 
           if [ -z "$OLD_ID" ] || [ "$OLD_ID" = "null" ]; then
             echo "ERROR: old_blue_cluster_id not in state — run bg-02-switchover first."
@@ -122,12 +125,14 @@ jobs:
             exit 1
           fi
 
-          echo "old_cluster_id=$OLD_ID" >> $GITHUB_OUTPUT
-          echo "bastion_id=$BASTION"    >> $GITHUB_OUTPUT
-          echo "db_secret_arn=$DB_SECRET" >> $GITHUB_OUTPUT
-          echo "Old cluster  : $OLD_ID"
-          echo "Bastion      : $BASTION"
-          echo "Secret ARN   : $DB_SECRET"
+          echo "old_cluster_id=$OLD_ID"           >> $GITHUB_OUTPUT
+          echo "bastion_id=$BASTION"               >> $GITHUB_OUTPUT
+          echo "db_secret_arn=$DB_SECRET"          >> $GITHUB_OUTPUT
+          echo "rollback_source=$ROLLBACK_SOURCE"  >> $GITHUB_OUTPUT
+          echo "Old cluster       : $OLD_ID"
+          echo "Bastion           : $BASTION"
+          echo "Secret ARN        : $DB_SECRET"
+          echo "Rollback source   : ${ROLLBACK_SOURCE:-<none — fresh run>}"
 
       # ── enable-replication path ───────────────────────────────────────────
       - name: Enable replication — new prod → old blue
@@ -155,8 +160,12 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
 
       # ── rollback pre-flight path ──────────────────────────────────────────
+      # Skip pre-flight if rollback_source_cluster_id is already set in state —
+      # that means Step 1 (new prod → -new1 rename) already completed on a prior
+      # run that failed mid-way. The new prod cluster is gone; describing it for
+      # a lag check would fail. Go straight to the terraform plan instead.
       - name: Rollback pre-flight — set new prod read-only, wait for lag = 0
-        if: inputs.action == 'rollback'
+        if: inputs.action == 'rollback' && steps.state.outputs.rollback_source == ''
         run: bash scripts/pre_proxy_flip.sh
         # PROXY_ACTIVE=old means we are about to switch to the old cluster.
         # The script sets the current active cluster (new prod) read-only and
@@ -168,6 +177,13 @@ jobs:
           AWS_REGION:            ${{ inputs.aws_region }}
           DB_SECRET_NAME:        ${{ steps.state.outputs.db_secret_arn }}
           BASTION_INSTANCE_ID:   ${{ steps.state.outputs.bastion_id }}
+
+      - name: Pre-flight skipped — partial rollback detected
+        if: inputs.action == 'rollback' && steps.state.outputs.rollback_source != ''
+        run: |
+          echo "[bg-03] rollback_source_cluster_id = ${{ steps.state.outputs.rollback_source }}"
+          echo "[bg-03] Step 1 already completed on a prior run — skipping pre-flight."
+          echo "[bg-03] Proceeding directly to terraform plan to resume from Step 2."
 
       - name: Terraform plan — name-swap rollback
         if: inputs.action == 'rollback'

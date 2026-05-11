@@ -216,3 +216,8 @@ output "replication_status" {
   value       = var.enable_blue_green ? aurora-bluegreen_deployment.main[0].replication_status : null
   description = "Binlog replication status for rollback (NOT_CONFIGURED / SETUP_PENDING / ACTIVE / STOPPED)"
 }
+
+output "rollback_source_cluster_id" {
+  value       = var.enable_blue_green ? aurora-bluegreen_deployment.main[0].rollback_source_cluster_id : ""
+  description = "Set to <orig>-new1 after Step 1 of name-swap rollback. Non-empty = partial rollback in progress — workflow skips pre-flight on re-runs."
+}
