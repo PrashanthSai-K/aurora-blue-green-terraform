@@ -4,15 +4,20 @@
 //
 //   Create → CreateBlueGreenDeployment + poll until AVAILABLE
 //   Read   → DescribeBlueGreenDeployments (drift detection on every plan)
+//            Skipped when deployment_deleted=true (B/G object already deleted)
 //   Update → SwitchoverBlueGreenDeployment when trigger_switchover flips true
 //            + re-attaches Auto Scaling policy post-switchover
 //            + populates old_source_cluster_id after switchover
 //            + optionally sets replication_status = SETUP_PENDING
 //            + flips RDS Proxy target when proxy_active_cluster changes
+//            + deletes B/G deployment object when delete_deployment_after_switchover flips true (keeps clusters)
+//            + name-swap rollback when trigger_rollback flips true:
+//                renames new prod → <orig>-new1
+//                renames old blue → <orig>  (restores original endpoint)
 //            + deletes old blue cluster when delete_old_cluster flips true
 //   Delete → guards against destroying while proxy routes to old cluster
 //            + optionally deletes old blue cluster (retain_old_cluster=false)
-//            + DeleteBlueGreenDeployment
+//            + DeleteBlueGreenDeployment (skipped when deployment_deleted=true)
 //
 // State is stored in the Terraform backend (S3) — no local files, no state
 // drift across CI runners or developer machines.
@@ -63,6 +68,9 @@ const (
 	// proxy_active_cluster values.
 	proxyClusterNew = "new"
 	proxyClusterOld = "old"
+
+	// Suffix appended to the new prod cluster during name-swap rollback.
+	rollbackNewClusterSuffix = "-new1"
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -135,21 +143,34 @@ type BlueGreenDeploymentModel struct {
 	RetainOldCluster types.Bool `tfsdk:"retain_old_cluster"`
 
 	// Binlog replication signaling.
-	// Provider sets SETUP_PENDING after switchover when enable_reverse_replication=true.
-	// The actual replication SQL is handled by scripts/pre_proxy_flip.sh and post_proxy_flip.sh.
 	EnableReverseReplication types.Bool   `tfsdk:"enable_reverse_replication"`
 	ReplicationStatus        types.String `tfsdk:"replication_status"`
 
 	// Proxy-based rollback control.
-	// "new" = proxy routes to current production (after switchover, the renamed green cluster).
-	// "old" = proxy routes to old blue cluster (rollback mode).
-	// Changing this triggers flipProxy() in Update(). Requires rds_proxy_name.
 	RDSProxyName       types.String `tfsdk:"rds_proxy_name"`
 	ProxyActiveCluster types.String `tfsdk:"proxy_active_cluster"`
 
-	// Set true to delete the old blue cluster immediately via Update()
-	// (instead of waiting for terraform destroy). Blocked if proxy_active_cluster="old".
+	// Set true to delete the old blue cluster immediately via Update().
 	DeleteOldCluster types.Bool `tfsdk:"delete_old_cluster"`
+
+	// ── Name-swap rollback ────────────────────────────────────────────────────
+	// delete_deployment_after_switchover: deletes the B/G deployment object after
+	// switchover completes, keeping both clusters intact. Required before trigger_rollback.
+	DeleteDeploymentAfterSwitchover types.Bool `tfsdk:"delete_deployment_after_switchover"`
+
+	// deployment_deleted: computed true once the B/G deployment object is deleted.
+	// Read() skips DescribeBlueGreenDeployments when this is true.
+	DeploymentDeleted types.Bool `tfsdk:"deployment_deleted"`
+
+	// trigger_rollback: when flipped to true, performs name-swap rollback:
+	//   1. Rename new prod (<orig>) → <orig>-new1
+	//   2. Rename old blue (<orig>-old1) → <orig>   (restores original endpoint)
+	// MySQL pre-flight (lag=0, read-only) must be done by GitHub Actions before applying.
+	TriggerRollback types.Bool `tfsdk:"trigger_rollback"`
+
+	// rollback_completed: computed true once name-swap rollback finishes.
+	// After this, delete_old_cluster=true removes the <orig>-new1 cluster.
+	RollbackCompleted types.Bool `tfsdk:"rollback_completed"`
 }
 
 var autoScalingAttrTypes = map[string]attr.Type{
@@ -168,9 +189,8 @@ var autoScalingAttrTypes = map[string]attr.Type{
 func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "Manages the full lifecycle of an Aurora MySQL Blue/Green Deployment. " +
-			"Creates the green cluster, stores deployment_id in Terraform state, handles " +
-			"switchover via a flag flip, re-attaches Auto Scaling policies post-switchover, " +
-			"and supports zero-data-loss rollback via RDS Proxy target flipping.",
+			"Creates the green cluster, handles switchover, deletes the B/G deployment object, " +
+			"and supports name-swap rollback to restore the original cluster endpoint.",
 
 		Attributes: map[string]schema.Attribute{
 			// ── Computed ────────────────────────────────────────────────
@@ -294,7 +314,7 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 			// ── Post-switchover state ─────────────────────────────────────
 			"old_source_cluster_id": schema.StringAttribute{
 				Computed:    true,
-				Description: "Cluster ID of the old blue cluster after switchover. Used for proxy-based rollback.",
+				Description: "Cluster ID of the old blue cluster after switchover. Used for rollback.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
@@ -312,14 +332,14 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(false),
-				Description: "Signals that binlog replication should be set up (actual SQL handled by pre/post_proxy_flip.sh). " +
-					"When true, provider sets replication_status = SETUP_PENDING after switchover.",
+				Description: "Signals that binlog replication should be set up. " +
+					"When true, provider sets replication_status = SETUP_PENDING after switchover. " +
+					"Actual replication SQL is handled by GitHub Actions (enable_replication.sh).",
 			},
 
 			"replication_status": schema.StringAttribute{
 				Computed:    true,
-				Description: "One of: NOT_CONFIGURED / SETUP_PENDING / ACTIVE / STOPPED. " +
-					"Provider sets SETUP_PENDING after switchover when enable_reverse_replication=true.",
+				Description: "One of: NOT_CONFIGURED / SETUP_PENDING / ACTIVE / STOPPED.",
 			},
 
 			// ── Proxy-based rollback ──────────────────────────────────────
@@ -332,9 +352,7 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 				Optional:    true,
 				Computed:    true,
 				Default:     stringdefault.StaticString(proxyClusterNew),
-				Description: "Which cluster the RDS Proxy routes to: \"new\" (current production) or \"old\" (rollback). " +
-					"Changing this value triggers a proxy target flip. " +
-					"Requires rds_proxy_name. Run pre_proxy_flip.sh before and post_proxy_flip.sh after changing to \"old\".",
+				Description: "Which cluster the RDS Proxy routes to: \"new\" (current production) or \"old\" (rollback). Requires rds_proxy_name.",
 			},
 
 			// ── On-demand old cluster deletion ────────────────────────────
@@ -342,8 +360,38 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(false),
-				Description: "Set true to delete the old blue cluster immediately (without destroying this resource). " +
-					"Blocked when proxy_active_cluster=\"old\". Idempotent — safe to leave true after deletion.",
+				Description: "Set true to delete the old cluster immediately (without destroying this resource). " +
+					"After name-swap rollback this deletes the <orig>-new1 cluster.",
+			},
+
+			// ── Name-swap rollback ────────────────────────────────────────
+			"delete_deployment_after_switchover": schema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(false),
+				Description: "Delete the B/G deployment object after switchover completes, keeping both clusters intact. " +
+					"Set true before trigger_rollback so the deployment object does not interfere with cluster renames.",
+			},
+
+			"deployment_deleted": schema.BoolAttribute{
+				Computed:    true,
+				Description: "True once the B/G deployment object has been deleted. Read() skips DescribeBlueGreenDeployments when true.",
+			},
+
+			"trigger_rollback": schema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(false),
+				Description: "Trigger name-swap rollback. " +
+					"Step 1: rename new prod (<orig>) → <orig>-new1. " +
+					"Step 2: rename old blue (<orig>-old1) → <orig> (restores original endpoint). " +
+					"Run GitHub Actions pre-flight (lag=0 + read-only) BEFORE setting this to true. " +
+					"After rollback completes, set delete_old_cluster=true to remove the <orig>-new1 cluster.",
+			},
+
+			"rollback_completed": schema.BoolAttribute{
+				Computed:    true,
+				Description: "True after name-swap rollback finishes successfully. The original cluster endpoint is restored.",
 			},
 		},
 	}
@@ -406,6 +454,10 @@ func (r *BlueGreenDeploymentResource) Create(ctx context.Context, req resource.C
 	plan.ReplicationStatus = types.StringValue(replStatusNotConfigured)
 	plan.ProxyActiveCluster = types.StringValue(proxyClusterNew)
 	plan.DeleteOldCluster = types.BoolValue(false)
+	plan.DeleteDeploymentAfterSwitchover = types.BoolValue(false)
+	plan.DeploymentDeleted = types.BoolValue(false)
+	plan.TriggerRollback = types.BoolValue(false)
+	plan.RollbackCompleted = types.BoolValue(false)
 
 	// Save partial state immediately — preserves deployment_id if poll is interrupted.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -428,13 +480,21 @@ func (r *BlueGreenDeploymentResource) Create(ctx context.Context, req resource.C
 
 // ─────────────────────────────────────────────────────────────
 // READ — DescribeBlueGreenDeployments (drift detection)
-// Called on every terraform plan and terraform apply.
+// Skipped when deployment_deleted=true.
 // ─────────────────────────────────────────────────────────────
 
 func (r *BlueGreenDeploymentResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state BlueGreenDeploymentModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// B/G deployment object was deleted — clusters are managed independently.
+	// Skip the Describe call; keep state as-is so rollback flags remain usable.
+	if state.DeploymentDeleted.ValueBool() {
+		tflog.Debug(ctx, "deployment_deleted=true — skipping DescribeBlueGreenDeployments")
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 		return
 	}
 
@@ -479,10 +539,6 @@ func (r *BlueGreenDeploymentResource) Read(ctx context.Context, req resource.Rea
 		state.DeploymentName = types.StringValue(*bg.BlueGreenDeploymentName)
 	}
 
-	// Only populate source_cluster_arn when not already in state.
-	// After switchover AWS renames the source cluster, so bg.Source no longer matches
-	// the user's config (which still references the original cluster name).
-	// Overwriting would cause a RequiresReplace diff and an unwanted destroy+recreate.
 	if state.SourceClusterARN.IsNull() || state.SourceClusterARN.ValueString() == "" {
 		if bg.Source != nil {
 			state.SourceClusterARN = types.StringValue(*bg.Source)
@@ -492,8 +548,6 @@ func (r *BlueGreenDeploymentResource) Read(ctx context.Context, req resource.Rea
 	if bg.Target != nil {
 		state.GreenClusterARN = types.StringValue(*bg.Target)
 
-		// target_engine_version and target_parameter_group_name are not returned
-		// by DescribeBlueGreenDeployments — fetch from the green cluster on import.
 		needVersion := state.TargetEngineVersion.IsNull() || state.TargetEngineVersion.ValueString() == ""
 		needParamGroup := state.TargetParameterGroupName.IsNull() || state.TargetParameterGroupName.ValueString() == ""
 
@@ -514,13 +568,11 @@ func (r *BlueGreenDeploymentResource) Read(ctx context.Context, req resource.Rea
 		}
 	}
 
-	// replication_status is externally managed — Read() does not overwrite it.
-
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // ─────────────────────────────────────────────────────────────
-// UPDATE — switchover, proxy flip, on-demand old cluster deletion
+// UPDATE
 // ─────────────────────────────────────────────────────────────
 
 func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -536,8 +588,8 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 	alreadyCompleted := state.Status.ValueString() == bgStatusSwitchoverCompleted
 	alreadyInProgress := state.Status.ValueString() == bgStatusSwitchoverInProgress
 
-	// ── Forward switchover ────────────────────────────────────────────────────
-	if plan.TriggerSwitchover.ValueBool() && !alreadyCompleted {
+	// ── Section 1: Forward switchover ────────────────────────────────────────
+	if plan.TriggerSwitchover.ValueBool() && !alreadyCompleted && !state.DeploymentDeleted.ValueBool() {
 		timeoutSec := state.SwitchoverTimeoutSec.ValueInt64()
 		if timeoutSec == 0 {
 			timeoutSec = 300
@@ -565,7 +617,6 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 			}
 		}
 
-		// Persist status immediately before polling — ensures deployment_id survives an interrupted apply.
 		state.TriggerSwitchover = types.BoolValue(true)
 		state.Status = types.StringValue(bgStatusSwitchoverInProgress)
 		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -596,10 +647,8 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		}
 	}
 
-	// ── Post-switchover actions ──────────────────────────────────────────────
-	// Runs whenever the deployment is SWITCHOVER_COMPLETED — whether it just
-	// completed in this apply or was completed in a previous one.
-	if state.Status.ValueString() == bgStatusSwitchoverCompleted {
+	// ── Section 2: Post-switchover actions ───────────────────────────────────
+	if state.Status.ValueString() == bgStatusSwitchoverCompleted && !state.DeploymentDeleted.ValueBool() {
 		postDescOut, postDescErr := r.clients.RDS.DescribeBlueGreenDeployments(ctx, &rds.DescribeBlueGreenDeploymentsInput{
 			BlueGreenDeploymentIdentifier: aws.String(deploymentID),
 		})
@@ -629,10 +678,106 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		}
 	}
 
-	// ── Section A: Proxy flip ─────────────────────────────────────────────────
-	// Triggered when proxy_active_cluster changes. The null_resource.pre_proxy_flip
-	// in blue_green.tf runs before this resource (via depends_on), ensuring the
-	// zero-data-loss sequence: read-only source → lag=0 → proxy flip → promote target.
+	// ── Section 3: Delete B/G deployment object ──────────────────────────────
+	// Deletes the AWS B/G deployment record after switchover. Both clusters are
+	// kept intact. Required before trigger_rollback so renames are unambiguous.
+	if plan.DeleteDeploymentAfterSwitchover.ValueBool() && !state.DeploymentDeleted.ValueBool() {
+		if state.Status.ValueString() != bgStatusSwitchoverCompleted {
+			resp.Diagnostics.AddError(
+				"Cannot delete B/G deployment object before switchover completes",
+				fmt.Sprintf("Current status: %s. Set trigger_switchover=true and apply first.", state.Status.ValueString()),
+			)
+			return
+		}
+
+		tflog.Info(ctx, "Deleting B/G deployment object (keeping both clusters)", map[string]any{
+			"deployment_id": deploymentID,
+		})
+
+		_, err := r.clients.RDS.DeleteBlueGreenDeployment(ctx, &rds.DeleteBlueGreenDeploymentInput{
+			BlueGreenDeploymentIdentifier: aws.String(deploymentID),
+			// DeleteTarget=false (default) keeps both clusters.
+		})
+		if err != nil && !isNotFoundError(err) {
+			resp.Diagnostics.AddError(
+				"Failed to delete B/G deployment object",
+				fmt.Sprintf("Error deleting %s: %s", deploymentID, err.Error()),
+			)
+			return
+		}
+
+		state.DeploymentDeleted = types.BoolValue(true)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		tflog.Info(ctx, "B/G deployment object deleted, both clusters retained", map[string]any{
+			"deployment_id":      deploymentID,
+			"old_cluster_id":     state.OldSourceClusterID.ValueString(),
+		})
+	}
+
+	// ── Section 4: Name-swap rollback ────────────────────────────────────────
+	// Restores the original cluster endpoint by renaming:
+	//   new prod (<orig>)      → <orig>-new1
+	//   old blue (<orig>-old1) → <orig>
+	//
+	// GitHub Actions MUST run pre-flight (read-only + lag=0) before this apply.
+	if plan.TriggerRollback.ValueBool() && !state.RollbackCompleted.ValueBool() {
+		oldClusterID := state.OldSourceClusterID.ValueString()
+		if oldClusterID == "" {
+			resp.Diagnostics.AddError(
+				"Cannot trigger rollback",
+				"old_source_cluster_id is empty — switchover must complete before rolling back.",
+			)
+			return
+		}
+
+		origClusterID := clusterIDFromARN(state.SourceClusterARN.ValueString())
+		newClusterTempID := origClusterID + rollbackNewClusterSuffix
+
+		tflog.Info(ctx, "Starting name-swap rollback", map[string]any{
+			"orig_cluster_id":  origClusterID,
+			"old_cluster_id":   oldClusterID,
+			"temp_cluster_id":  newClusterTempID,
+		})
+
+		// Step 1: rename new prod → <orig>-new1 (endpoint goes dark briefly)
+		tflog.Info(ctx, "Step 1: renaming new prod cluster", map[string]any{
+			"from": origClusterID, "to": newClusterTempID,
+		})
+		resp.Diagnostics.Append(r.renameCluster(ctx, origClusterID, newClusterTempID)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// Step 2: rename old blue → <orig> (endpoint restored)
+		tflog.Info(ctx, "Step 2: renaming old blue cluster to original name", map[string]any{
+			"from": oldClusterID, "to": origClusterID,
+		})
+		resp.Diagnostics.Append(r.renameCluster(ctx, oldClusterID, origClusterID)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		// After rollback: <orig>-new1 is now the cluster to delete.
+		// Reuse old_source_cluster_id to point at it so delete_old_cluster=true works.
+		state.OldSourceClusterID = types.StringValue(newClusterTempID)
+		state.RollbackCompleted = types.BoolValue(true)
+		state.TriggerRollback = types.BoolValue(true)
+
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		tflog.Info(ctx, "Name-swap rollback complete — original endpoint restored", map[string]any{
+			"restored_cluster":    origClusterID,
+			"pending_delete":      newClusterTempID,
+		})
+	}
+
+	// ── Section 5: Proxy flip ─────────────────────────────────────────────────
 	if !plan.ProxyActiveCluster.Equal(state.ProxyActiveCluster) {
 		proxyName := plan.RDSProxyName.ValueString()
 		if proxyName == "" {
@@ -641,8 +786,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		if proxyName == "" {
 			resp.Diagnostics.AddError(
 				"rds_proxy_name required for proxy flip",
-				"rds_proxy_name must be set to use proxy_active_cluster. "+
-					"Set rds_proxy_name in the resource configuration.",
+				"rds_proxy_name must be set to use proxy_active_cluster.",
 			)
 			return
 		}
@@ -661,7 +805,6 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 				return
 			}
 		case proxyClusterNew:
-			// Current production cluster keeps the original cluster identifier after switchover.
 			targetClusterID = clusterIDFromARN(plan.SourceClusterARN.ValueString())
 		default:
 			resp.Diagnostics.AddError(
@@ -685,13 +828,10 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 
 		state.ProxyActiveCluster = plan.ProxyActiveCluster
 
-		// Mark replication as stopped when proxy moves to old cluster.
-		// The post_proxy_flip.sh script will set up reverse replication separately.
 		if wantCluster == proxyClusterOld {
 			state.ReplicationStatus = types.StringValue(replStatusStopped)
 		}
 
-		// Save state immediately after proxy flip.
 		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -703,9 +843,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		})
 	}
 
-	// ── Section B: Delete old cluster on demand ───────────────────────────────
-	// Triggered when delete_old_cluster flips from false → true.
-	// Guard: proxy must not be pointing to old cluster.
+	// ── Section 6: Delete old cluster on demand ───────────────────────────────
 	if plan.DeleteOldCluster.ValueBool() && !state.DeleteOldCluster.ValueBool() {
 		currentProxy := state.ProxyActiveCluster.ValueString()
 		if currentProxy == "" {
@@ -724,8 +862,8 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		if oldClusterID == "" {
 			tflog.Warn(ctx, "delete_old_cluster=true but old_source_cluster_id is empty — nothing to delete")
 		} else {
-			tflog.Info(ctx, "delete_old_cluster=true — deleting old blue cluster", map[string]any{
-				"old_cluster_id": oldClusterID,
+			tflog.Info(ctx, "delete_old_cluster=true — deleting cluster", map[string]any{
+				"cluster_id": oldClusterID,
 			})
 			resp.Diagnostics.Append(r.deleteClusterAndInstances(ctx, oldClusterID)...)
 			if resp.Diagnostics.HasError() {
@@ -733,9 +871,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 				return
 			}
 			state.OldSourceClusterID = types.StringNull()
-			tflog.Info(ctx, "Old blue cluster deleted", map[string]any{
-				"old_cluster_id": oldClusterID,
-			})
+			tflog.Info(ctx, "Cluster deleted", map[string]any{"cluster_id": oldClusterID})
 		}
 		state.DeleteOldCluster = types.BoolValue(true)
 	}
@@ -749,11 +885,10 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 	state.RetainOldCluster = plan.RetainOldCluster
 	state.EnableReverseReplication = plan.EnableReverseReplication
 	state.RDSProxyName = plan.RDSProxyName
-	// ProxyActiveCluster is synced in Section A; if Section A didn't run, keep current.
+	state.DeleteDeploymentAfterSwitchover = plan.DeleteDeploymentAfterSwitchover
 	if plan.ProxyActiveCluster.Equal(state.ProxyActiveCluster) {
 		// Already in sync — no-op.
 	}
-	// DeleteOldCluster: if it was already true in state (cluster deleted), keep true even if plan says false.
 	if !state.DeleteOldCluster.ValueBool() {
 		state.DeleteOldCluster = plan.DeleteOldCluster
 	}
@@ -762,7 +897,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 }
 
 // ─────────────────────────────────────────────────────────────
-// DELETE — idempotent, guards against destroying during rollback
+// DELETE
 // ─────────────────────────────────────────────────────────────
 
 func (r *BlueGreenDeploymentResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -774,25 +909,22 @@ func (r *BlueGreenDeploymentResource) Delete(ctx context.Context, req resource.D
 
 	deploymentID := state.DeploymentID.ValueString()
 
-	// ── Guard: Proxy must not route to old cluster ───────────────────────────
-	// Destroying while proxy=old would strand production traffic on the old cluster
-	// with no Terraform-managed way to flip it back.
 	currentProxy := state.ProxyActiveCluster.ValueString()
 	if currentProxy == proxyClusterOld {
 		resp.Diagnostics.AddError(
 			"Cannot destroy while proxy routes to old cluster",
-			"Set proxy_active_cluster=\"new\" and run terraform apply before running terraform destroy. "+
-				"This prevents stranding production traffic on the old cluster.",
+			"Set proxy_active_cluster=\"new\" and run terraform apply before running terraform destroy.",
 		)
 		return
 	}
 
-	tflog.Info(ctx, "Deleting Blue/Green deployment", map[string]any{
+	tflog.Info(ctx, "Deleting Blue/Green deployment resource", map[string]any{
 		"deployment_id":      deploymentID,
+		"deployment_deleted": state.DeploymentDeleted.ValueBool(),
 		"retain_old_cluster": state.RetainOldCluster.ValueBool(),
 	})
 
-	// ── Step 1: Delete old blue cluster if retain_old_cluster=false ──────────
+	// Delete old blue cluster if retain_old_cluster=false.
 	if !state.RetainOldCluster.ValueBool() {
 		oldClusterID := state.OldSourceClusterID.ValueString()
 		if oldClusterID != "" {
@@ -806,7 +938,12 @@ func (r *BlueGreenDeploymentResource) Delete(ctx context.Context, req resource.D
 		}
 	}
 
-	// ── Step 2: Delete the main B/G deployment ───────────────────────────────
+	// Skip if deployment object was already deleted via delete_deployment_after_switchover.
+	if state.DeploymentDeleted.ValueBool() {
+		tflog.Info(ctx, "deployment_deleted=true — B/G deployment object already deleted, skipping API call")
+		return
+	}
+
 	input := &rds.DeleteBlueGreenDeploymentInput{
 		BlueGreenDeploymentIdentifier: aws.String(deploymentID),
 	}
@@ -817,9 +954,7 @@ func (r *BlueGreenDeploymentResource) Delete(ctx context.Context, req resource.D
 	_, err := r.clients.RDS.DeleteBlueGreenDeployment(ctx, input)
 	if err != nil {
 		if isNotFoundError(err) {
-			tflog.Info(ctx, "Deployment already deleted", map[string]any{
-				"deployment_id": deploymentID,
-			})
+			tflog.Info(ctx, "Deployment already deleted", map[string]any{"deployment_id": deploymentID})
 			return
 		}
 		resp.Diagnostics.AddError(
@@ -829,9 +964,7 @@ func (r *BlueGreenDeploymentResource) Delete(ctx context.Context, req resource.D
 		return
 	}
 
-	tflog.Info(ctx, "Blue/Green deployment deleted", map[string]any{
-		"deployment_id": deploymentID,
-	})
+	tflog.Info(ctx, "Blue/Green deployment deleted", map[string]any{"deployment_id": deploymentID})
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -851,23 +984,26 @@ func (r *BlueGreenDeploymentResource) ImportState(ctx context.Context, req resou
 	tflog.Info(ctx, "Importing Blue/Green deployment", map[string]any{"id": req.ID})
 
 	state := BlueGreenDeploymentModel{
-		ID:                       types.StringValue(req.ID),
-		DeploymentID:             types.StringValue(req.ID),
-		TriggerSwitchover:        types.BoolValue(false),
-		DeleteSourceCluster:      types.BoolValue(false),
-		CreateTimeoutMinutes:     types.Int64Value(90),
-		SwitchoverTimeoutSec:     types.Int64Value(300),
-		AutoScalingConfig:        types.ObjectNull(autoScalingAttrTypes),
-		OldSourceClusterID:       types.StringNull(),
-		RetainOldCluster:         types.BoolValue(true),
-		EnableReverseReplication: types.BoolValue(false),
-		ReplicationStatus:        types.StringValue(replStatusNotConfigured),
-		RDSProxyName:             types.StringNull(),
-		ProxyActiveCluster:       types.StringValue(proxyClusterNew),
-		DeleteOldCluster:         types.BoolValue(false),
+		ID:                              types.StringValue(req.ID),
+		DeploymentID:                    types.StringValue(req.ID),
+		TriggerSwitchover:               types.BoolValue(false),
+		DeleteSourceCluster:             types.BoolValue(false),
+		CreateTimeoutMinutes:            types.Int64Value(90),
+		SwitchoverTimeoutSec:            types.Int64Value(300),
+		AutoScalingConfig:               types.ObjectNull(autoScalingAttrTypes),
+		OldSourceClusterID:              types.StringNull(),
+		RetainOldCluster:                types.BoolValue(true),
+		EnableReverseReplication:        types.BoolValue(false),
+		ReplicationStatus:               types.StringValue(replStatusNotConfigured),
+		RDSProxyName:                    types.StringNull(),
+		ProxyActiveCluster:              types.StringValue(proxyClusterNew),
+		DeleteOldCluster:                types.BoolValue(false),
+		DeleteDeploymentAfterSwitchover: types.BoolValue(false),
+		DeploymentDeleted:               types.BoolValue(false),
+		TriggerRollback:                 types.BoolValue(false),
+		RollbackCompleted:               types.BoolValue(false),
 	}
 
-	// Read() will hydrate status, green_cluster_arn, etc. from AWS.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -875,8 +1011,7 @@ func (r *BlueGreenDeploymentResource) ImportState(ctx context.Context, req resou
 // HELPERS
 // ─────────────────────────────────────────────────────────────
 
-// waitForStatus polls DescribeBlueGreenDeployments until targetStatus is
-// reached or the timeout expires, updating the model in-place each poll.
+// waitForStatus polls until targetStatus or timeout.
 func (r *BlueGreenDeploymentResource) waitForStatus(
 	ctx context.Context,
 	deploymentID string,
@@ -913,10 +1048,9 @@ func (r *BlueGreenDeploymentResource) waitForStatus(
 		currentStatus := awsStringValue(bg.Status)
 
 		tflog.Info(ctx, "Polling Blue/Green deployment", map[string]any{
-			"deployment_id":      deploymentID,
-			"current_status":     currentStatus,
-			"target_status":      targetStatus,
-			"seen_non_available": seenNonAvailable,
+			"deployment_id":  deploymentID,
+			"current_status": currentStatus,
+			"target_status":  targetStatus,
 		})
 
 		model.Status = types.StringValue(currentStatus)
@@ -936,11 +1070,10 @@ func (r *BlueGreenDeploymentResource) waitForStatus(
 			return diags
 		}
 
-		// AVAILABLE after the switchover has started = AWS abandoned and reverted.
 		if targetStatus == bgStatusSwitchoverCompleted && currentStatus == bgStatusAvailable && seenNonAvailable {
 			diags.AddError(
 				"Switchover abandoned",
-				fmt.Sprintf("Deployment %s reverted to AVAILABLE after switchover started — AWS abandoned the operation. Check RDS Events in the AWS Console.", deploymentID),
+				fmt.Sprintf("Deployment %s reverted to AVAILABLE — AWS abandoned the operation. Check RDS Events.", deploymentID),
 			)
 			return diags
 		}
@@ -968,9 +1101,67 @@ func (r *BlueGreenDeploymentResource) waitForStatus(
 	return diags
 }
 
-// flipProxy deregisters the current cluster target(s) from the proxy and
-// registers the given targetClusterID. Idempotent: no-op if proxy already
-// points to targetClusterID.
+// renameCluster calls ModifyDBCluster with a new identifier and waits for
+// the cluster to become available under the new name.
+func (r *BlueGreenDeploymentResource) renameCluster(ctx context.Context, currentID, newID string) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	tflog.Info(ctx, "Renaming Aurora cluster", map[string]any{"from": currentID, "to": newID})
+
+	_, err := r.clients.RDS.ModifyDBCluster(ctx, &rds.ModifyDBClusterInput{
+		DBClusterIdentifier:    aws.String(currentID),
+		NewDBClusterIdentifier: aws.String(newID),
+		ApplyImmediately:       aws.Bool(true),
+	})
+	if err != nil {
+		diags.AddError(
+			"Failed to rename cluster",
+			fmt.Sprintf("ModifyDBCluster %s → %s: %s", currentID, newID, err.Error()),
+		)
+		return diags
+	}
+
+	tflog.Info(ctx, "Cluster rename initiated, waiting for available", map[string]any{"new_id": newID})
+	diags.Append(r.waitForClusterAvailable(ctx, newID, 15*time.Minute)...)
+	return diags
+}
+
+// waitForClusterAvailable polls DescribeDBClusters until the cluster
+// reaches "available" status under the given identifier.
+func (r *BlueGreenDeploymentResource) waitForClusterAvailable(ctx context.Context, clusterID string, timeout time.Duration) diag.Diagnostics {
+	var diags diag.Diagnostics
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		out, err := r.clients.RDS.DescribeDBClusters(ctx, &rds.DescribeDBClustersInput{
+			DBClusterIdentifier: aws.String(clusterID),
+		})
+		if err == nil && len(out.DBClusters) > 0 {
+			status := awsStringValue(out.DBClusters[0].Status)
+			tflog.Info(ctx, "Polling cluster availability", map[string]any{
+				"cluster_id": clusterID, "status": status,
+			})
+			if status == "available" {
+				return diags
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			diags.AddError("Context cancelled", fmt.Sprintf("cancelled while waiting for cluster %s to become available", clusterID))
+			return diags
+		case <-time.After(15 * time.Second):
+		}
+	}
+
+	diags.AddError(
+		"Timeout",
+		fmt.Sprintf("Cluster %s did not become available within %s after rename", clusterID, timeout),
+	)
+	return diags
+}
+
+// flipProxy deregisters current cluster targets and registers targetClusterID.
 func (r *BlueGreenDeploymentResource) flipProxy(ctx context.Context, proxyName, targetClusterID string) diag.Diagnostics {
 	var diags diag.Diagnostics
 
@@ -986,7 +1177,6 @@ func (r *BlueGreenDeploymentResource) flipProxy(ctx context.Context, proxyName, 
 		return diags
 	}
 
-	// Deregister existing cluster targets. Skip if already pointing to target.
 	for _, target := range targetsOut.Targets {
 		if target.Type != rdstypes.TargetTypeTrackedCluster {
 			continue
@@ -1000,8 +1190,7 @@ func (r *BlueGreenDeploymentResource) flipProxy(ctx context.Context, proxyName, 
 			return diags
 		}
 		tflog.Info(ctx, "Deregistering proxy target", map[string]any{
-			"proxy_name": proxyName,
-			"cluster_id": currentClusterID,
+			"proxy_name": proxyName, "cluster_id": currentClusterID,
 		})
 		_, deregErr := r.clients.RDS.DeregisterDBProxyTargets(ctx, &rds.DeregisterDBProxyTargetsInput{
 			DBProxyName:          aws.String(proxyName),
@@ -1016,7 +1205,6 @@ func (r *BlueGreenDeploymentResource) flipProxy(ctx context.Context, proxyName, 
 		}
 	}
 
-	// Register the target cluster.
 	_, regErr := r.clients.RDS.RegisterDBProxyTargets(ctx, &rds.RegisterDBProxyTargetsInput{
 		DBProxyName:          aws.String(proxyName),
 		TargetGroupName:      aws.String("default"),
@@ -1033,21 +1221,15 @@ func (r *BlueGreenDeploymentResource) flipProxy(ctx context.Context, proxyName, 
 	return diags
 }
 
-// deleteClusterAndInstances deletes all instances in the given cluster, waits
-// for each instance to be deleted, then deletes the cluster itself.
+// deleteClusterAndInstances deletes all instances then the cluster itself.
 func (r *BlueGreenDeploymentResource) deleteClusterAndInstances(ctx context.Context, clusterID string) diag.Diagnostics {
 	var diags diag.Diagnostics
 
-	tflog.Info(ctx, "Deleting cluster instances before cluster deletion", map[string]any{
-		"cluster_id": clusterID,
-	})
+	tflog.Info(ctx, "Deleting cluster instances before cluster deletion", map[string]any{"cluster_id": clusterID})
 
 	instancesOut, instancesErr := r.clients.RDS.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
 		Filters: []rdstypes.Filter{
-			{
-				Name:   aws.String("db-cluster-id"),
-				Values: []string{clusterID},
-			},
+			{Name: aws.String("db-cluster-id"), Values: []string{clusterID}},
 		},
 	})
 	if instancesErr != nil && !isNotFoundError(instancesErr) {
@@ -1062,10 +1244,8 @@ func (r *BlueGreenDeploymentResource) deleteClusterAndInstances(ctx context.Cont
 		for _, instance := range instancesOut.DBInstances {
 			instanceID := awsStringValue(instance.DBInstanceIdentifier)
 			tflog.Info(ctx, "Deleting cluster instance", map[string]any{
-				"instance_id": instanceID,
-				"cluster_id":  clusterID,
+				"instance_id": instanceID, "cluster_id": clusterID,
 			})
-
 			_, delInstanceErr := r.clients.RDS.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{
 				DBInstanceIdentifier: aws.String(instanceID),
 				SkipFinalSnapshot:    aws.Bool(true),
@@ -1081,11 +1261,9 @@ func (r *BlueGreenDeploymentResource) deleteClusterAndInstances(ctx context.Cont
 
 		if len(instancesOut.DBInstances) > 0 {
 			tflog.Info(ctx, "Waiting for cluster instances to be deleted", map[string]any{
-				"cluster_id":     clusterID,
-				"instance_count": len(instancesOut.DBInstances),
+				"cluster_id": clusterID, "instance_count": len(instancesOut.DBInstances),
 			})
-			waitDiags := r.waitForInstancesDeletion(ctx, clusterID, 30*time.Minute)
-			diags.Append(waitDiags...)
+			diags.Append(r.waitForInstancesDeletion(ctx, clusterID, 30*time.Minute)...)
 			if diags.HasError() {
 				return diags
 			}
@@ -1098,20 +1276,17 @@ func (r *BlueGreenDeploymentResource) deleteClusterAndInstances(ctx context.Cont
 	})
 	if delClusterErr != nil && !isNotFoundError(delClusterErr) {
 		diags.AddError(
-			"Failed to delete old blue cluster",
+			"Failed to delete cluster",
 			fmt.Sprintf("Error deleting cluster %s: %s", clusterID, delClusterErr.Error()),
 		)
 		return diags
 	}
 
-	tflog.Info(ctx, "Old blue cluster deleted", map[string]any{
-		"cluster_id": clusterID,
-	})
-
+	tflog.Info(ctx, "Cluster deleted", map[string]any{"cluster_id": clusterID})
 	return diags
 }
 
-// waitForInstancesDeletion polls until all instances in the given cluster are deleted.
+// waitForInstancesDeletion polls until all instances in the cluster are gone.
 func (r *BlueGreenDeploymentResource) waitForInstancesDeletion(ctx context.Context, clusterID string, timeout time.Duration) diag.Diagnostics {
 	var diags diag.Diagnostics
 	deadline := time.Now().Add(timeout)
@@ -1119,10 +1294,7 @@ func (r *BlueGreenDeploymentResource) waitForInstancesDeletion(ctx context.Conte
 	for time.Now().Before(deadline) {
 		instancesOut, instancesErr := r.clients.RDS.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
 			Filters: []rdstypes.Filter{
-				{
-					Name:   aws.String("db-cluster-id"),
-					Values: []string{clusterID},
-				},
+				{Name: aws.String("db-cluster-id"), Values: []string{clusterID}},
 			},
 		})
 
@@ -1138,9 +1310,7 @@ func (r *BlueGreenDeploymentResource) waitForInstancesDeletion(ctx context.Conte
 		}
 
 		if instancesOut == nil || len(instancesOut.DBInstances) == 0 {
-			tflog.Info(ctx, "All cluster instances deleted", map[string]any{
-				"cluster_id": clusterID,
-			})
+			tflog.Info(ctx, "All cluster instances deleted", map[string]any{"cluster_id": clusterID})
 			return diags
 		}
 
@@ -1151,16 +1321,13 @@ func (r *BlueGreenDeploymentResource) waitForInstancesDeletion(ctx context.Conte
 
 		select {
 		case <-ctx.Done():
-			diags.AddError("Context cancelled", "Terraform context was cancelled while waiting for instance deletion")
+			diags.AddError("Context cancelled", "cancelled while waiting for instance deletion")
 			return diags
 		case <-time.After(30 * time.Second):
 		}
 	}
 
-	diags.AddError(
-		"Timeout",
-		fmt.Sprintf("Instances in cluster %s were not deleted within the timeout", clusterID),
-	)
+	diags.AddError("Timeout", fmt.Sprintf("Instances in cluster %s were not deleted within the timeout", clusterID))
 	return diags
 }
 
@@ -1178,7 +1345,6 @@ func (r *BlueGreenDeploymentResource) reattachAutoScaling(ctx context.Context, p
 		return diags
 	}
 
-	// After switchover the production cluster keeps the original cluster identifier.
 	clusterID := clusterIDFromARN(plan.SourceClusterARN.ValueString())
 	resourceID := "cluster:" + clusterID
 
@@ -1205,8 +1371,6 @@ func (r *BlueGreenDeploymentResource) reattachAutoScaling(ctx context.Context, p
 		)
 		return diags
 	}
-
-	tflog.Info(ctx, "Registered scalable target", map[string]any{"resource_id": resourceID})
 
 	_, err = r.clients.AutoScaling.PutScalingPolicy(ctx, &applicationautoscaling.PutScalingPolicyInput{
 		PolicyName:        aws.String(asCfg.PolicyName.ValueString()),
@@ -1235,7 +1399,6 @@ func (r *BlueGreenDeploymentResource) reattachAutoScaling(ctx context.Context, p
 		"policy_name": asCfg.PolicyName.ValueString(),
 		"cluster_id":  clusterID,
 	})
-
 	return diags
 }
 
@@ -1260,3 +1423,4 @@ func isNotFoundError(err error) bool {
 		strings.Contains(msg, "does not exist") ||
 		strings.Contains(msg, "No Blue Green Deployment found")
 }
+
