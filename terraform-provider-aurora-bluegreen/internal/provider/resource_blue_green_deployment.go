@@ -150,27 +150,23 @@ type BlueGreenDeploymentModel struct {
 	RDSProxyName       types.String `tfsdk:"rds_proxy_name"`
 	ProxyActiveCluster types.String `tfsdk:"proxy_active_cluster"`
 
-	// Set true to delete the old blue cluster immediately via Update().
-	DeleteOldCluster types.Bool `tfsdk:"delete_old_cluster"`
-
-	// ── Name-swap rollback ────────────────────────────────────────────────────
-	// delete_deployment_after_switchover: deletes the B/G deployment object after
-	// switchover completes, keeping both clusters intact. Required before trigger_rollback.
-	DeleteDeploymentAfterSwitchover types.Bool `tfsdk:"delete_deployment_after_switchover"`
-
-	// deployment_deleted: computed true once the B/G deployment object is deleted.
-	// Read() skips DescribeBlueGreenDeployments when this is true.
+	// deployment_deleted: computed true after switchover cleanup deletes the B/G object.
+	// Read() and Delete() skip DescribeBlueGreenDeployments when this is true.
 	DeploymentDeleted types.Bool `tfsdk:"deployment_deleted"`
 
-	// trigger_rollback: when flipped to true, performs name-swap rollback:
-	//   1. Rename new prod (<orig>) → <orig>-new1
-	//   2. Rename old blue (<orig>-old1) → <orig>   (restores original endpoint)
-	// MySQL pre-flight (lag=0, read-only) must be done by GitHub Actions before applying.
+	// ── Name-swap rollback ────────────────────────────────────────────────────
+	// trigger_rollback: renames clusters to restore original endpoint.
+	//   Step 1: <orig>      → <orig>-new1  (prod endpoint goes dark briefly)
+	//   Step 2: <orig>-old1 → <orig>       (prod endpoint restored to old blue)
+	// Run GitHub Actions pre-flight (read-only + lag=0) BEFORE setting this true.
 	TriggerRollback types.Bool `tfsdk:"trigger_rollback"`
 
-	// rollback_completed: computed true once name-swap rollback finishes.
-	// After this, delete_old_cluster=true removes the <orig>-new1 cluster.
+	// rollback_completed: computed true after name-swap finishes.
 	RollbackCompleted types.Bool `tfsdk:"rollback_completed"`
+
+	// delete_cluster_after_rollback: set true (in a separate apply after rollback)
+	// to delete the <orig>-new1 cluster.
+	DeleteClusterAfterRollback types.Bool `tfsdk:"delete_cluster_after_rollback"`
 }
 
 var autoScalingAttrTypes = map[string]attr.Type{
@@ -355,43 +351,33 @@ func (r *BlueGreenDeploymentResource) Schema(_ context.Context, _ resource.Schem
 				Description: "Which cluster the RDS Proxy routes to: \"new\" (current production) or \"old\" (rollback). Requires rds_proxy_name.",
 			},
 
-			// ── On-demand old cluster deletion ────────────────────────────
-			"delete_old_cluster": schema.BoolAttribute{
-				Optional:    true,
+			// ── deployment_deleted (computed) ─────────────────────────────
+			"deployment_deleted": schema.BoolAttribute{
 				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-				Description: "Set true to delete the old cluster immediately (without destroying this resource). " +
-					"After name-swap rollback this deletes the <orig>-new1 cluster.",
+				Description: "Set true by the provider after switchover — once the B/G deployment object and old cluster are deleted. Read() and Delete() skip AWS calls when true.",
 			},
 
 			// ── Name-swap rollback ────────────────────────────────────────
-			"delete_deployment_after_switchover": schema.BoolAttribute{
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-				Description: "Delete the B/G deployment object after switchover completes, keeping both clusters intact. " +
-					"Set true before trigger_rollback so the deployment object does not interfere with cluster renames.",
-			},
-
-			"deployment_deleted": schema.BoolAttribute{
-				Computed:    true,
-				Description: "True once the B/G deployment object has been deleted. Read() skips DescribeBlueGreenDeployments when true.",
-			},
-
 			"trigger_rollback": schema.BoolAttribute{
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(false),
-				Description: "Trigger name-swap rollback. " +
+				Description: "Trigger name-swap rollback: " +
 					"Step 1: rename new prod (<orig>) → <orig>-new1. " +
-					"Step 2: rename old blue (<orig>-old1) → <orig> (restores original endpoint). " +
-					"Run GitHub Actions pre-flight (lag=0 + read-only) BEFORE setting this to true. " +
-					"After rollback completes, set delete_old_cluster=true to remove the <orig>-new1 cluster.",
+					"Step 2: rename old blue (<orig>-old1) → <orig> (original endpoint restored). " +
+					"Run GitHub Actions pre-flight (read-only + lag=0) BEFORE setting this to true.",
 			},
 
 			"rollback_completed": schema.BoolAttribute{
 				Computed:    true,
-				Description: "True after name-swap rollback finishes successfully. The original cluster endpoint is restored.",
+				Description: "True after name-swap rollback finishes. The original cluster endpoint is restored.",
+			},
+
+			"delete_cluster_after_rollback": schema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(false),
+				Description: "Set true (in a separate apply after rollback) to delete the <orig>-new1 cluster.",
 			},
 		},
 	}
@@ -453,11 +439,10 @@ func (r *BlueGreenDeploymentResource) Create(ctx context.Context, req resource.C
 	plan.OldSourceClusterID = types.StringNull()
 	plan.ReplicationStatus = types.StringValue(replStatusNotConfigured)
 	plan.ProxyActiveCluster = types.StringValue(proxyClusterNew)
-	plan.DeleteOldCluster = types.BoolValue(false)
-	plan.DeleteDeploymentAfterSwitchover = types.BoolValue(false)
 	plan.DeploymentDeleted = types.BoolValue(false)
 	plan.TriggerRollback = types.BoolValue(false)
 	plan.RollbackCompleted = types.BoolValue(false)
+	plan.DeleteClusterAfterRollback = types.BoolValue(false)
 
 	// Save partial state immediately — preserves deployment_id if poll is interrupted.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -678,25 +663,30 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		}
 	}
 
-	// ── Section 3: Delete B/G deployment object ──────────────────────────────
-	// Deletes the AWS B/G deployment record after switchover. Both clusters are
-	// kept intact. Required before trigger_rollback so renames are unambiguous.
-	if plan.DeleteDeploymentAfterSwitchover.ValueBool() && !state.DeploymentDeleted.ValueBool() {
-		if state.Status.ValueString() != bgStatusSwitchoverCompleted {
-			resp.Diagnostics.AddError(
-				"Cannot delete B/G deployment object before switchover completes",
-				fmt.Sprintf("Current status: %s. Set trigger_switchover=true and apply first.", state.Status.ValueString()),
-			)
-			return
+	// ── Section 3: Delete B/G deployment object + old cluster ───────────────
+	// Runs automatically after switchover succeeds. Deletes the AWS B/G deployment
+	// record AND the old blue cluster in one step.
+	if state.Status.ValueString() == bgStatusSwitchoverCompleted && !state.DeploymentDeleted.ValueBool() {
+		oldClusterID := state.OldSourceClusterID.ValueString()
+
+		// Delete old blue cluster first.
+		if oldClusterID != "" {
+			tflog.Info(ctx, "Post-switchover: deleting old blue cluster", map[string]any{
+				"old_cluster_id": oldClusterID,
+			})
+			resp.Diagnostics.Append(r.deleteClusterAndInstances(ctx, oldClusterID)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			state.OldSourceClusterID = types.StringNull()
 		}
 
-		tflog.Info(ctx, "Deleting B/G deployment object (keeping both clusters)", map[string]any{
+		// Delete the B/G deployment object (keeps new prod cluster intact).
+		tflog.Info(ctx, "Post-switchover: deleting B/G deployment object", map[string]any{
 			"deployment_id": deploymentID,
 		})
-
 		_, err := r.clients.RDS.DeleteBlueGreenDeployment(ctx, &rds.DeleteBlueGreenDeploymentInput{
 			BlueGreenDeploymentIdentifier: aws.String(deploymentID),
-			// DeleteTarget=false (default) keeps both clusters.
 		})
 		if err != nil && !isNotFoundError(err) {
 			resp.Diagnostics.AddError(
@@ -711,10 +701,7 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		tflog.Info(ctx, "B/G deployment object deleted, both clusters retained", map[string]any{
-			"deployment_id":      deploymentID,
-			"old_cluster_id":     state.OldSourceClusterID.ValueString(),
-		})
+		tflog.Info(ctx, "Post-switchover cleanup complete — B/G deployment and old cluster deleted")
 	}
 
 	// ── Section 4: Name-swap rollback ────────────────────────────────────────
@@ -737,31 +724,24 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		newClusterTempID := origClusterID + rollbackNewClusterSuffix
 
 		tflog.Info(ctx, "Starting name-swap rollback", map[string]any{
-			"orig_cluster_id":  origClusterID,
-			"old_cluster_id":   oldClusterID,
-			"temp_cluster_id":  newClusterTempID,
+			"orig_cluster_id": origClusterID,
+			"old_cluster_id":  oldClusterID,
+			"temp_cluster_id": newClusterTempID,
 		})
 
 		// Step 1: rename new prod → <orig>-new1 (endpoint goes dark briefly)
-		tflog.Info(ctx, "Step 1: renaming new prod cluster", map[string]any{
-			"from": origClusterID, "to": newClusterTempID,
-		})
 		resp.Diagnostics.Append(r.renameCluster(ctx, origClusterID, newClusterTempID)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
 		// Step 2: rename old blue → <orig> (endpoint restored)
-		tflog.Info(ctx, "Step 2: renaming old blue cluster to original name", map[string]any{
-			"from": oldClusterID, "to": origClusterID,
-		})
 		resp.Diagnostics.Append(r.renameCluster(ctx, oldClusterID, origClusterID)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
-		// After rollback: <orig>-new1 is now the cluster to delete.
-		// Reuse old_source_cluster_id to point at it so delete_old_cluster=true works.
+		// Point old_source_cluster_id at <orig>-new1 so delete_cluster_after_rollback can find it.
 		state.OldSourceClusterID = types.StringValue(newClusterTempID)
 		state.RollbackCompleted = types.BoolValue(true)
 		state.TriggerRollback = types.BoolValue(true)
@@ -770,14 +750,35 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		if resp.Diagnostics.HasError() {
 			return
 		}
-
 		tflog.Info(ctx, "Name-swap rollback complete — original endpoint restored", map[string]any{
-			"restored_cluster":    origClusterID,
-			"pending_delete":      newClusterTempID,
+			"restored_cluster": origClusterID,
+			"pending_delete":   newClusterTempID,
 		})
 	}
 
-	// ── Section 5: Proxy flip ─────────────────────────────────────────────────
+	// ── Section 5: Delete <orig>-new1 after rollback ──────────────────────────
+	if plan.DeleteClusterAfterRollback.ValueBool() && !state.DeleteClusterAfterRollback.ValueBool() {
+		if !state.RollbackCompleted.ValueBool() {
+			resp.Diagnostics.AddError(
+				"Cannot delete cluster before rollback completes",
+				"Set trigger_rollback=true and apply first.",
+			)
+			return
+		}
+		newClusterID := state.OldSourceClusterID.ValueString()
+		if newClusterID != "" {
+			tflog.Info(ctx, "Deleting post-rollback cluster", map[string]any{"cluster_id": newClusterID})
+			resp.Diagnostics.Append(r.deleteClusterAndInstances(ctx, newClusterID)...)
+			if resp.Diagnostics.HasError() {
+				resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+				return
+			}
+			state.OldSourceClusterID = types.StringNull()
+		}
+		state.DeleteClusterAfterRollback = types.BoolValue(true)
+	}
+
+	// ── Section 6: Proxy flip ─────────────────────────────────────────────────
 	if !plan.ProxyActiveCluster.Equal(state.ProxyActiveCluster) {
 		proxyName := plan.RDSProxyName.ValueString()
 		if proxyName == "" {
@@ -843,39 +844,6 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 		})
 	}
 
-	// ── Section 6: Delete old cluster on demand ───────────────────────────────
-	if plan.DeleteOldCluster.ValueBool() && !state.DeleteOldCluster.ValueBool() {
-		currentProxy := state.ProxyActiveCluster.ValueString()
-		if currentProxy == "" {
-			currentProxy = proxyClusterNew
-		}
-
-		if currentProxy == proxyClusterOld {
-			resp.Diagnostics.AddError(
-				"Cannot delete old cluster while proxy routes to it",
-				"Set proxy_active_cluster=\"new\" and re-apply before setting delete_old_cluster=true.",
-			)
-			return
-		}
-
-		oldClusterID := state.OldSourceClusterID.ValueString()
-		if oldClusterID == "" {
-			tflog.Warn(ctx, "delete_old_cluster=true but old_source_cluster_id is empty — nothing to delete")
-		} else {
-			tflog.Info(ctx, "delete_old_cluster=true — deleting cluster", map[string]any{
-				"cluster_id": oldClusterID,
-			})
-			resp.Diagnostics.Append(r.deleteClusterAndInstances(ctx, oldClusterID)...)
-			if resp.Diagnostics.HasError() {
-				resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-				return
-			}
-			state.OldSourceClusterID = types.StringNull()
-			tflog.Info(ctx, "Cluster deleted", map[string]any{"cluster_id": oldClusterID})
-		}
-		state.DeleteOldCluster = types.BoolValue(true)
-	}
-
 	// ── Sync all mutable plan fields to state ────────────────────────────────
 	state.TriggerSwitchover = plan.TriggerSwitchover
 	state.DeleteSourceCluster = plan.DeleteSourceCluster
@@ -885,12 +853,8 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 	state.RetainOldCluster = plan.RetainOldCluster
 	state.EnableReverseReplication = plan.EnableReverseReplication
 	state.RDSProxyName = plan.RDSProxyName
-	state.DeleteDeploymentAfterSwitchover = plan.DeleteDeploymentAfterSwitchover
-	if plan.ProxyActiveCluster.Equal(state.ProxyActiveCluster) {
-		// Already in sync — no-op.
-	}
-	if !state.DeleteOldCluster.ValueBool() {
-		state.DeleteOldCluster = plan.DeleteOldCluster
+	if !state.DeleteClusterAfterRollback.ValueBool() {
+		state.DeleteClusterAfterRollback = plan.DeleteClusterAfterRollback
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -984,24 +948,23 @@ func (r *BlueGreenDeploymentResource) ImportState(ctx context.Context, req resou
 	tflog.Info(ctx, "Importing Blue/Green deployment", map[string]any{"id": req.ID})
 
 	state := BlueGreenDeploymentModel{
-		ID:                              types.StringValue(req.ID),
-		DeploymentID:                    types.StringValue(req.ID),
-		TriggerSwitchover:               types.BoolValue(false),
-		DeleteSourceCluster:             types.BoolValue(false),
-		CreateTimeoutMinutes:            types.Int64Value(90),
-		SwitchoverTimeoutSec:            types.Int64Value(300),
-		AutoScalingConfig:               types.ObjectNull(autoScalingAttrTypes),
-		OldSourceClusterID:              types.StringNull(),
-		RetainOldCluster:                types.BoolValue(true),
-		EnableReverseReplication:        types.BoolValue(false),
-		ReplicationStatus:               types.StringValue(replStatusNotConfigured),
-		RDSProxyName:                    types.StringNull(),
-		ProxyActiveCluster:              types.StringValue(proxyClusterNew),
-		DeleteOldCluster:                types.BoolValue(false),
-		DeleteDeploymentAfterSwitchover: types.BoolValue(false),
-		DeploymentDeleted:               types.BoolValue(false),
-		TriggerRollback:                 types.BoolValue(false),
-		RollbackCompleted:               types.BoolValue(false),
+		ID:                         types.StringValue(req.ID),
+		DeploymentID:               types.StringValue(req.ID),
+		TriggerSwitchover:          types.BoolValue(false),
+		DeleteSourceCluster:        types.BoolValue(false),
+		CreateTimeoutMinutes:       types.Int64Value(90),
+		SwitchoverTimeoutSec:       types.Int64Value(300),
+		AutoScalingConfig:          types.ObjectNull(autoScalingAttrTypes),
+		OldSourceClusterID:         types.StringNull(),
+		RetainOldCluster:           types.BoolValue(true),
+		EnableReverseReplication:   types.BoolValue(false),
+		ReplicationStatus:          types.StringValue(replStatusNotConfigured),
+		RDSProxyName:               types.StringNull(),
+		ProxyActiveCluster:         types.StringValue(proxyClusterNew),
+		DeploymentDeleted:          types.BoolValue(false),
+		TriggerRollback:            types.BoolValue(false),
+		RollbackCompleted:          types.BoolValue(false),
+		DeleteClusterAfterRollback: types.BoolValue(false),
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
