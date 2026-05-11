@@ -112,12 +112,14 @@ PROXY_ACTIVE='${PROXY_ACTIVE}'
 
 mysql_exec() {
   local host="\$1"; shift
-  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+    --connect-timeout=10 -sNe "\$@" 2>/dev/null
 }
 # mysql_status keeps column headers (no -N) so SHOW...STATUS\G output can be grepped by label
 mysql_status() {
   local host="\$1"; shift
-  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -se "\$@" 2>/dev/null
+  mysql -h "\$host" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+    --connect-timeout=10 -se "\$@" 2>/dev/null
 }
 
 if ! command -v mysql &>/dev/null; then
@@ -127,24 +129,30 @@ if ! command -v mysql &>/dev/null; then
 fi
 command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not available"; exit 1; }
 
-# For repromote: check if target is actually replicating before waiting
-if [[ "\$PROXY_ACTIVE" == "new" ]]; then
-  LAG_CHECK=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
-    | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
-  if [[ -z "\$LAG_CHECK" || "\$LAG_CHECK" == "NULL" ]]; then
-    echo "[bastion] WARN: target (\$TARGET_ENDPOINT) is not replicating — skipping lag wait."
+# Check if the target cluster is actually replicating before entering the lag-wait loop.
+# This applies for both rollback (PROXY_ACTIVE=old) and repromote (PROXY_ACTIVE=new).
+# If replication was never set up, waiting for Seconds_Behind_Master=0 would loop until
+# MAX_LAG_WAIT_SEC timeout and then fail. Instead, warn and skip the wait — a rollback
+# without prior replication accepts potential data loss from the window since switchover.
+LAG_CHECK=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
+  | grep "Seconds_Behind_Master:" | awk '{print \$2}' || true)
+if [[ -z "\$LAG_CHECK" || "\$LAG_CHECK" == "NULL" ]]; then
+  echo "[bastion] WARN: target (\$TARGET_ENDPOINT) is not replicating — skipping lag wait."
+  if [[ "\$PROXY_ACTIVE" == "old" ]]; then
+    echo "[bastion] TIP: run bg-03 enable-replication before rollback next time for zero-lag cutover."
+  else
     echo "[bastion] TIP: run bg-03 enable-replication after rollback to set up replication for zero-lag repromote."
-    echo "[bastion] Pre-flight complete (no replication active)."
-    exit 0
   fi
+  echo "[bastion] Pre-flight complete (no replication active)."
+  exit 0
 fi
 
 echo "[bastion] Attempting to set source (\$SOURCE_ENDPOINT) to read-only (best-effort)..."
 # Aurora MySQL writer instances cannot be set to read_only=1 from a client connection —
 # Aurora's cluster management enforces the writer stays read-write.
 # We attempt it anyway (it works on plain RDS MySQL) and warn if it fails.
-RO_OUTPUT=\$(mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
-  -sNe "SET GLOBAL read_only = 1;" 2>&1) && \
+mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+  --connect-timeout=10 -sNe "SET GLOBAL read_only = 1;" 2>&1 && \
   echo "[bastion] Source is read-only." || \
   echo "[bastion] WARN: Could not set read_only=1 on Aurora writer (Aurora enforces writer=read-write). Ensure no application writes during the rollback window. Proceeding to lag check."
 
@@ -155,7 +163,7 @@ while true; do
   if (( ELAPSED >= MAX_LAG_WAIT_SEC )); then
     echo "[bastion] TIMEOUT: lag did not reach 0 within \${MAX_LAG_WAIT_SEC}s"
     mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
-      -sNe "SET GLOBAL read_only = 0;" 2>/dev/null || true
+      --connect-timeout=10 -sNe "SET GLOBAL read_only = 0;" 2>/dev/null || true
     exit 1
   fi
   LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \

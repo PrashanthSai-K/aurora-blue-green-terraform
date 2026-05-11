@@ -86,7 +86,8 @@ DB_USER='${DB_USER}'
 DB_PASS='${DB_PASS}'
 
 mysql_exec() {
-  mysql -h "\$ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" -sNe "\$@" 2>/dev/null
+  mysql -h "\$ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+    --connect-timeout=10 -sNe "\$@" 2>/dev/null
 }
 
 if ! command -v mysql &>/dev/null; then
@@ -104,7 +105,7 @@ echo "[bastion] Promoting to read-write..."
 # Best-effort: Aurora writer instances are always read-write at the cluster level,
 # so this may be a no-op. It works on plain RDS MySQL.
 mysql -h "\$ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
-  -sNe "SET GLOBAL read_only = 0;" 2>/dev/null || true
+  --connect-timeout=10 -sNe "SET GLOBAL read_only = 0;" 2>/dev/null || true
 
 RO=\$(mysql_exec "SELECT @@global.read_only;" 2>/dev/null || echo "0")
 if [[ "\$RO" == "1" ]]; then
