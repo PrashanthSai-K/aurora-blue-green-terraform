@@ -751,6 +751,28 @@ func (r *BlueGreenDeploymentResource) Update(ctx context.Context, req resource.U
 	// Both steps are idempotent — if a previous apply failed mid-way, re-running
 	// safely resumes from whichever step was not yet completed.
 	// GitHub Actions MUST run pre-flight (lag=0) before this apply.
+	//
+	// Auto-reset: if rollback_completed=true in state but the <orig>-new1 cluster no
+	// longer exists (e.g. a user manually reversed the rename after a failed apply),
+	// clear the completion flag so the rollback can re-run cleanly.
+	if plan.TriggerRollback.ValueBool() && state.RollbackCompleted.ValueBool() {
+		origClusterIDCheck := clusterIDFromARN(state.SourceClusterARN.ValueString())
+		new1IDCheck := origClusterIDCheck + rollbackNewClusterSuffix
+		new1Exists, _ := r.clusterExists(ctx, new1IDCheck)
+		if !new1Exists {
+			// <orig>-new1 is gone — AWS was manually reversed after a previous rollback.
+			// Reset completion state so Section 4 can re-run. Also restore
+			// old_source_cluster_id to the -old1 name (what it was post-switchover)
+			// because that cluster is back at its old name after the manual reversal.
+			tflog.Info(ctx, "rollback_completed=true but -new1 cluster absent — AWS was manually reversed; resetting rollback state", map[string]any{
+				"missing_cluster":     new1IDCheck,
+				"restored_cluster_id": origClusterIDCheck + rollbackOldInstanceSuffix,
+			})
+			state.RollbackCompleted = types.BoolValue(false)
+			state.RollbackSourceClusterID = types.StringValue("")
+			state.OldSourceClusterID = types.StringValue(origClusterIDCheck + rollbackOldInstanceSuffix)
+		}
+	}
 	if plan.TriggerRollback.ValueBool() && !state.RollbackCompleted.ValueBool() {
 		oldClusterID := state.OldSourceClusterID.ValueString()
 		if oldClusterID == "" {
