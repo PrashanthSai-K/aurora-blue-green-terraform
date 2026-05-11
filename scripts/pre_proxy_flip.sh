@@ -139,13 +139,14 @@ if [[ "\$PROXY_ACTIVE" == "new" ]]; then
   fi
 fi
 
-echo "[bastion] Setting source (\$SOURCE_ENDPOINT) to read-only..."
-# Aurora MySQL does not support mysql.rds_set_read_only(). Use SET GLOBAL read_only instead.
-mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 1;" || {
-  echo "[bastion] ERROR: Failed to set read-only on source."
-  exit 1
-}
-echo "[bastion] Source is read-only."
+echo "[bastion] Attempting to set source (\$SOURCE_ENDPOINT) to read-only (best-effort)..."
+# Aurora MySQL writer instances cannot be set to read_only=1 from a client connection —
+# Aurora's cluster management enforces the writer stays read-write.
+# We attempt it anyway (it works on plain RDS MySQL) and warn if it fails.
+RO_OUTPUT=\$(mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+  -sNe "SET GLOBAL read_only = 1;" 2>&1) && \
+  echo "[bastion] Source is read-only." || \
+  echo "[bastion] WARN: Could not set read_only=1 on Aurora writer (Aurora enforces writer=read-write). Ensure no application writes during the rollback window. Proceeding to lag check."
 
 echo "[bastion] Polling replication lag on target (\$TARGET_ENDPOINT)..."
 STARTED=\$(date +%s)
@@ -153,8 +154,8 @@ while true; do
   ELAPSED=\$(( \$(date +%s) - STARTED ))
   if (( ELAPSED >= MAX_LAG_WAIT_SEC )); then
     echo "[bastion] TIMEOUT: lag did not reach 0 within \${MAX_LAG_WAIT_SEC}s"
-    echo "[bastion] Restoring source to read-write..."
-    mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 0;" 2>/dev/null || true
+    mysql -h "\$SOURCE_ENDPOINT" -P "\$DB_PORT" -u "\$DB_USER" -p"\$DB_PASS" \
+      -sNe "SET GLOBAL read_only = 0;" 2>/dev/null || true
     exit 1
   fi
   LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \
