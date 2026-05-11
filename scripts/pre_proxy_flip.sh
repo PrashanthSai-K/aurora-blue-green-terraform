@@ -140,7 +140,8 @@ if [[ "\$PROXY_ACTIVE" == "new" ]]; then
 fi
 
 echo "[bastion] Setting source (\$SOURCE_ENDPOINT) to read-only..."
-mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_only();" || {
+# Aurora MySQL does not support mysql.rds_set_read_only(). Use SET GLOBAL read_only instead.
+mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 1;" || {
   echo "[bastion] ERROR: Failed to set read-only on source."
   exit 1
 }
@@ -153,7 +154,7 @@ while true; do
   if (( ELAPSED >= MAX_LAG_WAIT_SEC )); then
     echo "[bastion] TIMEOUT: lag did not reach 0 within \${MAX_LAG_WAIT_SEC}s"
     echo "[bastion] Restoring source to read-write..."
-    mysql_exec "\$SOURCE_ENDPOINT" "CALL mysql.rds_set_read_write();" 2>/dev/null || true
+    mysql_exec "\$SOURCE_ENDPOINT" "SET GLOBAL read_only = 0;" 2>/dev/null || true
     exit 1
   fi
   LAG=\$(mysql_status "\$TARGET_ENDPOINT" "SHOW SLAVE STATUS\G" \

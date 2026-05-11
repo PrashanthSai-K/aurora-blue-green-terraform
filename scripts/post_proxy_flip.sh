@@ -98,13 +98,15 @@ command -v mysql &>/dev/null || { echo "[bastion] ERROR: mysql client not availa
 
 echo "[bastion] Stopping any replication on \$ENDPOINT..."
 mysql_exec "CALL mysql.rds_stop_replication();" 2>/dev/null || true
+mysql_exec "CALL mysql.rds_reset_external_master();" 2>/dev/null || true
 
 echo "[bastion] Promoting to read-write..."
-mysql_exec "CALL mysql.rds_set_read_write();" 2>/dev/null || true
+# Aurora MySQL does not support mysql.rds_set_read_write(). Use SET GLOBAL read_only instead.
+mysql_exec "SET GLOBAL read_only = 0;" 2>/dev/null || true
 
 RO=\$(mysql_exec "SELECT @@global.read_only;" 2>/dev/null || echo "UNKNOWN")
 if [[ "\$RO" == "1" ]]; then
-  echo "[bastion] ERROR: cluster is still read-only after rds_set_read_write"
+  echo "[bastion] ERROR: cluster is still read-only after SET GLOBAL read_only = 0"
   exit 1
 fi
 echo "[bastion] Cluster is read-write (read_only=\$RO). Done."
